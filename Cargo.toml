@@ -1,5 +1,5 @@
 [package]
-name = "nkg-folder"
+name = "nkg-virtual-folder"
 version = "0.1.0"
 edition = "2024"
 description = "A virtual-first, dockable Windows file workspace"

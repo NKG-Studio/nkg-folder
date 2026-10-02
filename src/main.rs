@@ -40,7 +40,7 @@ fn main() -> eframe::Result {
         Ok(path) => path,
         Err(error) => {
             rfd::MessageDialog::new()
-                .set_title("NKG Folder — 配置目录错误")
+                .set_title("NKG Virtual Folder — 配置目录错误")
                 .set_description(error)
                 .set_level(rfd::MessageLevel::Error)
                 .show();
@@ -48,7 +48,7 @@ fn main() -> eframe::Result {
         }
     };
     eframe::run_native(
-        "NKG Folder",
+        "NKG Virtual Folder",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_icon(

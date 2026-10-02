@@ -1223,7 +1223,7 @@ impl eframe::App for FolderApp {
             ui.horizontal_centered(|ui| {
                 ui.image((self.app_icon.id(), Vec2::new(20.0, 20.0)));
                 let title = ui.add(
-                    egui::Label::new(RichText::new("NKG FOLDER").size(13.0))
+                    egui::Label::new(RichText::new("NKG Virtual Folder").size(13.0))
                         .sense(Sense::click_and_drag()),
                 );
                 drag_title_bar(&title);

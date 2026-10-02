@@ -1,4 +1,8 @@
-# NKG Folder
+<p align="center">
+  <img src="assets/app-icon-master.png" alt="NKG Virtual Folder" width="360" />
+</p>
+
+# NKG Virtual Folder
 
 面向多项目、多分支开发的 Windows 文件工作区。Rust 原生桌面程序，默认四分屏、深色扁平界面、紧凑树列表。
 
@@ -6,7 +10,7 @@
 
 ## 启动
 
-Release 程序是 `artifacts/nkg-folder.exe`（单文件可执行程序）。关闭旧版后运行新版。常规构建产物位于 `target/release/nkg-folder.exe`；也可在项目目录执行：
+Release 程序是 `artifacts/nkg-virtual-folder.exe`（单文件可执行程序）。关闭旧版后运行新版。常规构建产物位于 `target/release/nkg-virtual-folder.exe`；也可在项目目录执行：
 
 ```powershell
 cargo run --release
@@ -14,7 +18,7 @@ cargo run --release
 
 开发环境为 Rust 1.97.1 / Windows x64 MSVC。构建需要 Rust 和 Visual Studio C++ Build Tools；运行已构建的 EXE 不需要 Rust、Node.js、WebView 或 Unity。
 
-应用图标使用提供的 NK 图片，源图保存在 `assets/app-icon-master.png`。`assets/app.ico` 包含 16–256 像素的多尺寸图标，由 `build.rs` 嵌入 EXE；`assets/app-icon.png` 用于窗口、任务栏及自绘标题栏。图标已嵌入程序，分发时无需附带 assets 目录。
+应用图标保留橙色 NK 图案，并在右下角加入 VF 标识，源图保存在 `assets/app-icon-master.png`。`assets/app.ico` 包含 16–256 像素的多尺寸图标，由 `build.rs` 嵌入 EXE；`assets/app-icon.png` 用于窗口、任务栏及自绘标题栏。图标已嵌入程序，分发时无需附带 assets 目录。
 
 ## 日常使用
 
