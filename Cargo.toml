@@ -9,15 +9,17 @@ license = "MIT"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 egui_dock = { version = "0.20.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 rfd = "0.17"
 trash = "5"
 tempfile = "3"
+notify = "8.2.0"
+crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
 clipboard-win = { version = "5.4", features = ["std"] }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Pipes", "Win32_System_Memory", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Time", "Win32_System_Threading", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 lto = "thin"

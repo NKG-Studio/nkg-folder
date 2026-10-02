@@ -155,12 +155,14 @@ pub fn display_path(path: &Path) -> String {
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum Location {
+    Empty,
     Disk(PathBuf),
     Virtual(u64),
 }
 
 #[derive(Clone, Debug)]
 pub struct Row {
+    pub modified: Option<std::time::SystemTime>,
     pub key: String,
     pub name: String,
     pub depth: usize,
@@ -170,14 +172,72 @@ pub struct Row {
     pub detail: String,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortOrder {
+    Type,
+    #[default]
+    Name,
+    Modified,
+}
+
+impl SortOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Type => "类型",
+            Self::Name => "名称",
+            Self::Modified => "修改日期",
+        }
+    }
+
+    pub fn key(
+        self,
+        name: &str,
+        directory: bool,
+        modified: Option<std::time::SystemTime>,
+    ) -> (
+        bool,
+        String,
+        std::cmp::Reverse<Option<std::time::SystemTime>>,
+        String,
+    ) {
+        let kind = if self == Self::Type && !directory {
+            Path::new(name)
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        } else {
+            String::new()
+        };
+        (
+            !directory,
+            kind,
+            std::cmp::Reverse(if self == Self::Modified {
+                modified
+            } else {
+                None
+            }),
+            name.to_lowercase(),
+        )
+    }
+
+    pub fn sort_results(self, rows: &mut [Row]) {
+        rows.sort_by_cached_key(|r| (self.key(&r.name, r.directory, r.modified), r.key.clone()));
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Pane {
     pub id: u64,
     pub location: Location,
     pub address: String,
     pub expanded: HashSet<String>,
+    #[serde(default)]
+    pub sort: SortOrder,
     #[serde(skip)]
     pub filter: String,
+    #[serde(skip)]
+    pub search_visible: bool,
     #[serde(skip)]
     pub search_deadline: Option<std::time::Instant>,
     #[serde(skip)]
@@ -187,7 +247,13 @@ pub struct Pane {
     #[serde(skip)]
     pub selected: HashSet<String>,
     #[serde(skip)]
+    pub pending_selection: Option<String>,
+    #[serde(skip)]
     pub anchor: Option<usize>,
+    #[serde(skip)]
+    pub marquee: Option<crate::app::Marquee>,
+    #[serde(skip)]
+    pub selection_info: crate::app::SelectionInfo,
     #[serde(skip)]
     pub history: Vec<Location>,
     #[serde(skip)]
@@ -201,12 +267,17 @@ impl Pane {
             location: location.clone(),
             address: String::new(),
             expanded: HashSet::new(),
+            sort: SortOrder::default(),
             filter: String::new(),
+            search_visible: false,
             search_deadline: None,
             rows: Vec::new(),
             row_stamp: String::new(),
             selected: HashSet::new(),
+            pending_selection: None,
             anchor: None,
+            marquee: None,
+            selection_info: Default::default(),
             history: Vec::new(),
             forward: Vec::new(),
         };
@@ -220,11 +291,14 @@ impl Pane {
         }
         self.address = match &location {
             Location::Disk(p) => display_path(p),
-            Location::Virtual(_) => String::new(),
+            Location::Virtual(_) | Location::Empty => String::new(),
         };
         self.location = location;
         self.selected.clear();
+        self.pending_selection = None;
         self.anchor = None;
+        self.marquee = None;
+        self.selection_info = Default::default();
         self.row_stamp.clear();
         self.filter.clear();
         self.search_deadline = None;
@@ -309,6 +383,46 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    pub fn new_empty_workspace(&mut self) -> u64 {
+        let pane_id = self.next_id;
+        self.next_id += 1;
+        self.dock
+            .push_to_focused_leaf(Pane::new(pane_id, Location::Empty));
+        pane_id
+    }
+
+    pub fn import_paths(&mut self, id: u64, paths: Vec<(PathBuf, bool)>) -> Result<usize, String> {
+        if id != 0 {
+            return self
+                .root
+                .find_mut(id)
+                .ok_or("虚拟节点已被移除")?
+                .add_paths(paths, &mut self.next_id);
+        }
+        let Some((first, _)) = paths.first() else {
+            return Ok(0);
+        };
+        let Kind::Folder(children) = &mut self.root.kind else {
+            return Err("工作区根节点无效".into());
+        };
+        let base = path_name(first);
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while children.iter().any(|node| node.name == name) {
+            name = format!("{base} ({suffix})");
+            suffix += 1;
+        }
+        let mut group = Node {
+            id: self.next_id,
+            name,
+            kind: Kind::Folder(vec![]),
+        };
+        self.next_id += 1;
+        let count = group.add_paths(paths, &mut self.next_id)?;
+        children.push(group);
+        Ok(count)
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         match fs::read(path) {
             Ok(bytes) => Self::from_bytes(&bytes),
@@ -318,7 +432,14 @@ impl Workspace {
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let mut state: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let legacy_sort = value
+            .get("sort")
+            .cloned()
+            .map(serde_json::from_value::<SortOrder>)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut state: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
         if state.version != 1 {
             return Err("不支持的工作区版本".into());
         }
@@ -349,9 +470,12 @@ impl Workspace {
         }
         // Refresh old saved address text without rewriting native paths or expanded IDs.
         for (_, pane) in state.dock.iter_all_tabs_mut() {
+            if let Some(sort) = legacy_sort {
+                pane.sort = sort;
+            }
             pane.address = match &pane.location {
                 Location::Disk(path) => display_path(path),
-                Location::Virtual(_) => String::new(),
+                Location::Virtual(_) | Location::Empty => String::new(),
             };
         }
         Ok(state)
@@ -396,6 +520,70 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_workspaces_are_independent_and_persist() {
+        let mut state = Workspace::default();
+        let before = serde_json::to_vec(&state.root).unwrap();
+        let first = state.new_empty_workspace();
+        let second = state.new_empty_workspace();
+        assert_ne!(first, second);
+        assert_eq!(before, serde_json::to_vec(&state.root).unwrap());
+        let restored = Workspace::from_bytes(&serde_json::to_vec(&state).unwrap()).unwrap();
+        for id in [first, second] {
+            let pane = restored
+                .dock
+                .iter_all_tabs()
+                .find(|(_, p)| p.id == id)
+                .unwrap()
+                .1;
+            assert_eq!(pane.location, Location::Empty);
+        }
+    }
+    #[test]
+    fn root_import_creates_named_workspaces_and_existing_groups_accept_references() {
+        let mut state = Workspace::default();
+        let paths = vec![
+            (PathBuf::from("C:/project"), true),
+            (PathBuf::from("C:/note.txt"), false),
+        ];
+        assert_eq!(state.import_paths(0, paths.clone()).unwrap(), 2);
+        let Kind::Folder(groups) = &state.root.kind else {
+            panic!()
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "project");
+        let id = groups[0].id;
+        assert_eq!(
+            groups[0].real_paths(),
+            vec![PathBuf::from("C:/project"), PathBuf::from("C:/note.txt")]
+        );
+        assert_eq!(state.import_paths(id, paths.clone()).unwrap(), 0);
+        state.import_paths(0, paths).unwrap();
+        state.import_paths(0, vec![]).unwrap();
+        let Kind::Folder(groups) = &state.root.kind else {
+            panic!()
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1].name, "project (2)");
+        let restored = Workspace::from_bytes(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.root.real_paths(), state.root.real_paths());
+    }
+
+    #[test]
+    fn legacy_global_sort_migrates_to_independent_panes() {
+        let mut json = serde_json::to_value(Workspace::default()).unwrap();
+        json["sort"] = serde_json::json!("Modified");
+        let state = Workspace::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(
+            state
+                .dock
+                .iter_all_tabs()
+                .all(|(_, pane)| pane.sort == SortOrder::Modified)
+        );
+        assert!(serde_json::to_value(state).unwrap().get("sort").is_none());
+    }
+
     #[test]
     fn theme_roundtrip_and_legacy_workspace_default() {
         let mut workspace = Workspace::default();
@@ -557,5 +745,12 @@ mod tests {
         assert!(root.reparent(0, 1).is_err());
         assert!(root.reparent(2, 3).is_err());
         assert_eq!(serde_json::to_string(&root).unwrap(), before);
+        root.reparent(3, 0).unwrap();
+        assert!(root.find(1).unwrap().find(3).is_none());
+        assert!(matches!(&root.kind, Kind::Folder(children) if children.iter().any(|n| n.id == 3)));
+        assert_eq!(
+            root.find(3).unwrap().real_paths(),
+            vec![PathBuf::from("C:/project/config.json")]
+        );
     }
 }

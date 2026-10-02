@@ -86,12 +86,44 @@ mod native {
                 0x80070057u32 as i32,
             )));
         }
-        // The desktop accepts absolute ID lists, including a selection from several directories.
+        // GetUIObjectOf requires immediate children of the actual parent, not
+        // absolute multi-component PIDLs handed to Desktop (Properties can target This PC).
+        let parent: IShellFolder = unsafe { SHBindToParent(items[0].0, None)? };
+        let parent_id = Item(unsafe { SHGetIDListFromObject(&parent)? });
+        if items
+            .iter()
+            .all(|item| unsafe { ILIsParent(parent_id.0, item.0, true) }.as_bool())
+        {
+            let children: Vec<_> = items
+                .iter()
+                .map(|item| unsafe { ILFindLastID(item.0) } as *const ITEMIDLIST)
+                .collect();
+            return unsafe { parent.GetUIObjectOf(owner, &children, None) };
+        }
+
+        // Cross-folder selections need the default composite menu, rather than
+        // the Desktop namespace's own context-menu handler.
         let pointers: Vec<_> = items
             .iter()
             .map(|item| item.0 as *const ITEMIDLIST)
             .collect();
-        unsafe { SHGetDesktopFolder()?.GetUIObjectOf(owner, &pointers, None) }
+        let desktop = unsafe { SHGetDesktopFolder()? };
+        if T::IID == IContextMenu::IID {
+            let mut selection: Vec<_> = items.iter().map(|item| item.0).collect();
+            let menu = DEFCONTEXTMENU {
+                hwnd: owner,
+                psf: std::mem::ManuallyDrop::new(Some(desktop)),
+                cidl: selection.len() as u32,
+                apidl: selection.as_mut_ptr(),
+                ..Default::default()
+            };
+            let result = unsafe { SHCreateDefaultContextMenu(&menu) };
+            drop(std::mem::ManuallyDrop::into_inner(menu.psf));
+            result
+        } else {
+            // Desktop's data object preserves absolute cross-folder selections (CF_HDROP).
+            unsafe { desktop.GetUIObjectOf(owner, &pointers, None) }
+        }
     }
 
     fn needs_open_with(path: &Path, code: windows::core::HRESULT) -> bool {
@@ -144,7 +176,55 @@ mod native {
         paths: &[PathBuf],
         owner: HWND,
     ) -> windows::core::Result<IDataObject> {
-        shell_object(paths, owner)
+        shell_object(paths, owner).or_else(|_| path_data_object(paths))
+    }
+
+    // A protected parent can prevent Shell PIDL parsing in the ordinary GUI process.
+    // CF_HDROP carries the original paths without reading or staging their contents.
+    fn path_data_object(paths: &[PathBuf]) -> windows::core::Result<IDataObject> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::System::{
+            Memory::*,
+            Ole::{CF_HDROP, ReleaseStgMedium},
+        };
+        let paths = paths
+            .iter()
+            .map(|p| {
+                shell_path(p).map(|wide| {
+                    PathBuf::from(std::ffi::OsString::from_wide(&wide[..wide.len() - 1]))
+                })
+            })
+            .collect::<windows::core::Result<Vec<_>>>()?;
+        let bytes = crate::clipboard::drop_files(&paths)
+            .map_err(|e| windows::core::Error::new(windows::core::HRESULT::from_win32(87), e))?;
+        unsafe {
+            let data: IDataObject = SHCreateDataObject(None, None, None::<&IDataObject>)?;
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
+            let pointer = GlobalLock(memory);
+            if pointer.is_null() {
+                let _ = windows::Win32::Foundation::GlobalFree(Some(memory));
+                return Err(windows::core::Error::from_thread());
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.cast(), bytes.len());
+            let _ = GlobalUnlock(memory);
+            let format = FORMATETC {
+                cfFormat: CF_HDROP.0,
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+                ..Default::default()
+            };
+            let mut medium = STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: memory },
+                pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            };
+            if let Err(error) = data.SetData(&format, &medium, true) {
+                ReleaseStgMedium(&mut medium);
+                return Err(error);
+            }
+            Ok(data)
+        }
     }
 
     struct Handler {
@@ -335,15 +415,46 @@ mod native {
             std::fs::create_dir(&second).unwrap();
             let second = second.join("sample.txt");
             std::fs::write(&second, "sample").unwrap();
-            let context: IContextMenu = shell_object(&[file, second], HWND::default()).unwrap();
-            let menu = Menu(unsafe { CreatePopupMenu().unwrap() });
-            unsafe {
-                context
-                    .QueryContextMenu(menu.0, 0, 1, 0x7fff, CMF_NORMAL)
-                    .ok()
-                    .unwrap();
+            let sibling = root.path().join("sibling.txt");
+            std::fs::write(&sibling, "sample").unwrap();
+            for paths in [
+                vec![file.clone()],
+                vec![file.clone(), sibling],
+                vec![file, second],
+            ] {
+                let context: IContextMenu = shell_object(&paths, HWND::default()).unwrap();
+                let menu = Menu(unsafe { CreatePopupMenu().unwrap() });
+                let result = unsafe { context.QueryContextMenu(menu.0, 0, 1, 0x7fff, CMF_NORMAL) };
+                result.ok().unwrap();
+                let mut verbs = Vec::new();
+                for command in 0..(result.0 as u32 & 0xffff) {
+                    let mut buffer = [0u16; 256];
+                    if unsafe {
+                        context.GetCommandString(
+                            command as usize,
+                            GCS_VERBW,
+                            None,
+                            windows::core::PSTR(buffer.as_mut_ptr().cast()),
+                            buffer.len() as u32,
+                        )
+                    }
+                    .is_ok()
+                    {
+                        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+                        verbs.push(String::from_utf16_lossy(&buffer[..end]));
+                    }
+                }
+                assert!(verbs.iter().any(|v| v == "properties"), "{verbs:?}");
+                assert!(
+                    verbs.iter().any(|v| v == "delete"),
+                    "wrong selection menu: {verbs:?}"
+                );
+                assert!(
+                    !verbs.iter().any(|v| v.eq_ignore_ascii_case("manage")),
+                    "This PC menu: {verbs:?}"
+                );
+                assert!(unsafe { GetMenuItemCount(Some(menu.0)) } > 0);
             }
-            assert!(unsafe { GetMenuItemCount(Some(menu.0)) } > 0);
         }
     }
 }

@@ -1,9 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod backend;
 mod clipboard;
 mod drag_drop;
 mod files;
+mod global_search;
 mod model;
 mod search;
 mod shell_menu;
@@ -36,6 +38,10 @@ fn config_directory() -> Result<std::path::PathBuf, String> {
 }
 
 fn main() -> eframe::Result {
+    if backend::worker_entry() {
+        return Ok(());
+    }
+    backend::initialize();
     let config_directory = match config_directory() {
         Ok(path) => path,
         Err(error) => {

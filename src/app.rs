@@ -1,22 +1,50 @@
 use crate::{
     files::{self, DirectoryCache, Listing, Operation},
-    model::{Kind, Location, Node, Pane, Row, Workspace, display_path, path_name},
+    model::{Kind, Location, Node, Pane, Row, SortOrder, Workspace, display_path, path_name},
 };
 use eframe::egui::{self, Color32, Id, RichText, Sense, Vec2};
-use egui_dock::{DockArea, NodePath, Split, TabViewer};
+use egui_dock::{DockArea, TabViewer};
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-const ROW_HEIGHT: f32 = 25.0;
+const ROW_HEIGHT: f32 = 22.0;
+type TargetGuards = Vec<(PathBuf, files::FileIdentity)>;
+
+#[derive(Clone)]
+pub(crate) struct Marquee {
+    origin: egui::Pos2,
+    before: HashSet<String>,
+    anchor: Option<usize>,
+    additive: bool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SelectionInfo {
+    selected: HashSet<String>,
+    revision: (u64, u64),
+    title: String,
+    paths: Vec<PathBuf>,
+    next_read: Option<Instant>,
+    result: Arc<Mutex<String>>,
+    running: Arc<AtomicBool>,
+}
 
 #[derive(Clone, Copy)]
 enum Icon {
+    OpenFolder,
+    NewPane,
+    Sort,
+    Search,
     Folder,
     NewFolder,
     NewFile,
@@ -24,8 +52,6 @@ enum Icon {
     VirtualFile,
     Home,
     Drive,
-    SplitRight,
-    SplitBelow,
     Back,
     Forward,
     Up,
@@ -85,21 +111,69 @@ fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: Co
             painter.add(egui::Shape::line(
                 outline
                     .into_iter()
-                    .map(|(x, y)| center + Vec2::new(x, y))
+                    .map(|(x, y)| center + Vec2::new(x, y) * 0.8)
                     .collect(),
                 stroke,
             ));
-            let plus = center + Vec2::new(5.0, -5.0);
+            let plus = center + Vec2::new(4.0, -4.0);
             painter.line_segment(
-                [plus - Vec2::new(3.0, 0.0), plus + Vec2::new(3.0, 0.0)],
+                [plus - Vec2::new(2.4, 0.0), plus + Vec2::new(2.4, 0.0)],
                 stroke,
             );
             painter.line_segment(
-                [plus - Vec2::new(0.0, 3.0), plus + Vec2::new(0.0, 3.0)],
+                [plus - Vec2::new(0.0, 2.4), plus + Vec2::new(0.0, 2.4)],
                 stroke,
             );
         }
-        Icon::Folder => {
+        Icon::NewPane => {
+            painter.rect_stroke(rect, 1.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    center + Vec2::new(-7.0, -2.0),
+                    center + Vec2::new(7.0, -2.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(-3.0, 2.0), center + Vec2::new(3.0, 2.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(0.0, -1.0), center + Vec2::new(0.0, 5.0)],
+                stroke,
+            );
+        }
+        Icon::Search => {
+            painter.circle_stroke(center - Vec2::splat(2.0), 4.5, stroke);
+            painter.line_segment(
+                [center + Vec2::splat(1.5), center + Vec2::splat(6.0)],
+                stroke,
+            );
+        }
+        Icon::Sort => {
+            for (y, width) in [(-5.0, 8.0), (0.0, 5.0), (5.0, 2.0)] {
+                painter.line_segment(
+                    [
+                        center + Vec2::new(-7.0, y),
+                        center + Vec2::new(-7.0 + width, y),
+                    ],
+                    stroke,
+                );
+            }
+            painter.line_segment(
+                [center + Vec2::new(5.0, -5.0), center + Vec2::new(5.0, 5.0)],
+                stroke,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    center + Vec2::new(2.0, 2.0),
+                    center + Vec2::new(5.0, 5.0),
+                    center + Vec2::new(8.0, 2.0),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Folder | Icon::OpenFolder => {
             painter.add(egui::Shape::closed_line(
                 [
                     (-7.0, -5.0),
@@ -262,12 +336,6 @@ fn paint_icon(painter: &egui::Painter, center: egui::Pos2, icon: Icon, color: Co
                     );
                     painter.circle_filled(rect.right_bottom() - Vec2::new(3.0, 2.0), 0.8, color);
                 }
-                Icon::SplitRight => {
-                    painter.line_segment([rect.center_top(), rect.center_bottom()], stroke);
-                }
-                Icon::SplitBelow => {
-                    painter.line_segment([rect.left_center(), rect.right_center()], stroke);
-                }
                 _ => {
                     painter.line_segment(
                         [center + Vec2::new(-3.0, 0.0), center + Vec2::new(3.0, 0.0)],
@@ -288,7 +356,7 @@ fn icon_button(ui: &mut egui::Ui, label: &str, icon: Icon, color: Color32) -> eg
     );
     let width = (galley.size().x + 36.0).min(ui.available_width());
     let response = ui.add_sized(
-        [width, 25.0],
+        [width, ROW_HEIGHT],
         egui::Button::new("")
             .frame(false)
             .sense(Sense::click_and_drag()),
@@ -314,7 +382,11 @@ fn icon_button(ui: &mut egui::Ui, label: &str, icon: Icon, color: Color32) -> eg
 }
 
 fn tool_button(ui: &mut egui::Ui, icon: Icon, label: &str, size: [f32; 2]) -> egui::Response {
-    let response = ui.add_sized(size, egui::Button::new("").frame(false));
+    let framed = matches!(
+        icon,
+        Icon::OpenFolder | Icon::NewPane | Icon::Sort | Icon::Search
+    );
+    let response = ui.add_sized(size, egui::Button::new("").frame(framed));
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -327,33 +399,11 @@ fn tool_button(ui: &mut egui::Ui, icon: Icon, label: &str, size: [f32; 2]) -> eg
     response.on_hover_text(label)
 }
 
-fn split_button(ui: &mut egui::Ui, vertical: bool) -> egui::Response {
-    let label = if vertical {
-        "上下分屏"
-    } else {
-        "左右分屏"
-    };
-    let response = ui.add_sized([26.0, 22.0], egui::Button::new("").frame(false));
-    response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-    });
-    paint_icon(
-        ui.painter(),
-        response.rect.center(),
-        if vertical {
-            Icon::SplitBelow
-        } else {
-            Icon::SplitRight
-        },
-        ui.visuals().weak_text_color(),
-    );
-    response.on_hover_text(label)
-}
-
 enum Action {
     Navigate(u64, Location),
     NewPane(Location),
-    Split(u64, Split),
+    NewEmptyWorkspace,
+    BindPane(u64, Vec<PathBuf>),
     Choose(u64),
     Open(PathBuf),
     SystemMenu(Vec<PathBuf>),
@@ -367,7 +417,7 @@ enum Action {
     MoveVirtual(u64, u64),
     RenameReal(PathBuf),
     NewReal(PathBuf, bool),
-    DeleteReal(Vec<PathBuf>),
+    DeleteReal(Vec<PathBuf>, bool),
     Copy(Vec<PathBuf>, bool),
     Paste(PathBuf),
     Transfer(Vec<PathBuf>, PathBuf, bool),
@@ -381,6 +431,7 @@ enum Action {
 struct VirtualDrag(u64);
 
 enum Event {
+    PanePaths(u64, Result<Vec<(PathBuf, bool)>, String>),
     Imported(u64, Result<Vec<(PathBuf, bool)>, String>),
     PickedDirectory(Option<PathBuf>),
     PickedWorkspace(Option<PathBuf>),
@@ -393,7 +444,7 @@ enum Event {
 enum Edit {
     Virtual { parent: u64, file: bool },
     VirtualName(u64),
-    RealName(PathBuf),
+    RealName(PathBuf, TargetGuards),
     RealNew { parent: PathBuf, directory: bool },
 }
 struct EditDialog {
@@ -408,6 +459,7 @@ pub struct FolderApp {
     workspace: Workspace,
     cache: DirectoryCache,
     searches: HashMap<u64, crate::search::Search>,
+    global_search: crate::global_search::GlobalSearch,
     actions: Vec<Action>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -415,10 +467,13 @@ pub struct FolderApp {
     error: bool,
     active: u64,
     sidebar_open: HashSet<u64>,
+    sidebar_filter: String,
+    sidebar_search: WorkspaceSearch,
     revision: u64,
     chooser: Option<u64>,
     edit: Option<EditDialog>,
-    delete: Option<Vec<PathBuf>>,
+    delete: Option<(Vec<PathBuf>, bool, TargetGuards)>,
+    cut_guards: TargetGuards,
     busy: bool,
     config: PathBuf,
     writable: bool,
@@ -476,6 +531,13 @@ impl FolderApp {
         let (tx, rx) = mpsc::channel();
         let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon.png"))
             .expect("embedded application icon");
+        let mut global_search = crate::global_search::GlobalSearch::default();
+        global_search.warm(
+            error
+                .is_none()
+                .then(|| config.with_file_name("file-index.bin")),
+            &cc.egui_ctx,
+        );
         Self {
             app_icon: cc.egui_ctx.load_texture(
                 "app-icon",
@@ -488,6 +550,7 @@ impl FolderApp {
             workspace,
             cache: DirectoryCache::new(cc.egui_ctx.clone()),
             searches: HashMap::new(),
+            global_search,
             actions: vec![],
             tx,
             rx,
@@ -497,10 +560,13 @@ impl FolderApp {
             error: error.is_some(),
             active: 1,
             sidebar_open: HashSet::from([0]),
+            sidebar_filter: String::new(),
+            sidebar_search: WorkspaceSearch::default(),
             revision: 1,
             chooser: None,
             edit: None,
             delete: None,
+            cut_guards: Vec::new(),
             busy: false,
             config,
             writable: error.is_none(),
@@ -535,8 +601,10 @@ impl FolderApp {
             if pane.location != search.location {
                 return false;
             }
+            let was_done = search.done;
             for entry in search.poll() {
                 pane.rows.push(Row {
+                    modified: entry.modified,
                     key: format!("p:{}", entry.path.display()),
                     name: entry.name,
                     depth: 0,
@@ -546,19 +614,61 @@ impl FolderApp {
                     detail: display_path(&entry.path),
                 });
             }
+            if search.done && !was_done {
+                pane.sort.sort_results(&mut pane.rows);
+                pane.anchor = None;
+                pane.marquee = None;
+            }
+            if search.changed && !search.cancelled() && pane.filter == search.query {
+                pane.rows.clear();
+                pane.marquee = None;
+                pane.selected.clear();
+                pane.anchor = None;
+                self.actions.push(Action::Search(
+                    *id,
+                    search.location.clone(),
+                    search.query.clone(),
+                ));
+                search.changed = false;
+            }
             true
         });
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::PanePaths(id, result) => match result {
+                    Ok(paths) => {
+                        // Ignore a late drop if its original empty tab was closed or navigated.
+                        if !self
+                            .workspace
+                            .dock
+                            .iter_all_tabs()
+                            .any(|(_, p)| p.id == id && p.location == Location::Empty)
+                        {
+                            continue;
+                        }
+                        for (index, (path, directory)) in paths.into_iter().enumerate() {
+                            let target = if index == 0 {
+                                id
+                            } else {
+                                self.workspace.new_empty_workspace()
+                            };
+                            if let Some((_, pane)) = self
+                                .workspace
+                                .dock
+                                .iter_all_tabs_mut()
+                                .find(|(_, p)| p.id == target)
+                            {
+                                bind_real_path(pane, path, directory);
+                            }
+                        }
+                        self.active = id;
+                    }
+                    Err(error) => self.message(Err(error)),
+                },
                 Event::Imported(id, result) => {
-                    let result = result.and_then(|paths| {
-                        self.workspace
-                            .root
-                            .find_mut(id)
-                            .ok_or_else(|| "虚拟节点已被移除".to_string())?
-                            .add_paths(paths, &mut self.workspace.next_id)
-                    });
+                    let result = result.and_then(|paths| self.workspace.import_paths(id, paths));
                     self.revision += 1;
+                    self.refresh();
                     self.message(result.map(|n| format!("已添加 {n} 个路径引用；真实文件未移动")));
                 }
                 Event::PickedDirectory(Some(path)) => {
@@ -601,7 +711,7 @@ impl FolderApp {
                 Event::Progress(message) => self.status = message,
                 Event::Finished(result) => {
                     self.busy = false;
-                    self.cache.refresh();
+                    self.refresh();
                     self.message(result);
                 }
                 Event::Opened(result) => {
@@ -613,11 +723,77 @@ impl FolderApp {
         }
     }
 
+    fn refresh(&mut self) {
+        self.cache.refresh();
+        for (_, pane) in self.workspace.dock.iter_all_tabs_mut() {
+            if let Some(search) = self.searches.get(&pane.id)
+                && pane.location == search.location
+                && pane.filter == search.query
+            {
+                pane.rows.clear();
+                pane.marquee = None;
+                pane.selected.clear();
+                pane.anchor = None;
+                self.actions.push(Action::Search(
+                    pane.id,
+                    search.location.clone(),
+                    search.query.clone(),
+                ));
+            }
+        }
+    }
+
+    fn target_guards(&self, paths: &[PathBuf]) -> Result<TargetGuards, String> {
+        paths
+            .iter()
+            .map(|path| {
+                let snapshot = self
+                    .searches
+                    .get(&self.active)
+                    .and_then(|s| s.identities.get(path))
+                    .or_else(|| self.searches.values().find_map(|s| s.identities.get(path)));
+                let identity = match snapshot {
+                    Some(Some(identity)) => identity.clone(),
+                    Some(None) => {
+                        return Err(format!(
+                            "搜索时未能核验目标：{}；请刷新后重试",
+                            display_path(path)
+                        ));
+                    }
+                    None => files::file_identity(path)?,
+                };
+                Ok((path.clone(), identity))
+            })
+            .collect()
+    }
+
     fn operation(&mut self, ctx: &egui::Context, operation: Operation) {
         if self.busy {
             self.message(Err("已有文件操作正在执行，请稍候。".into()));
             return;
         }
+        let paths = match &operation {
+            Operation::Copy {
+                sources,
+                moving: true,
+                ..
+            } => sources.clone(),
+            Operation::Rename { source, .. } => vec![source.clone()],
+            Operation::Trash(paths) | Operation::PermanentDelete(paths) => paths.clone(),
+            _ => Vec::new(),
+        };
+        let operation = if paths.is_empty() {
+            operation
+        } else {
+            match self.target_guards(&paths) {
+                Ok(expected) => Operation::Checked(expected, Box::new(operation)),
+                Err(error) => {
+                    self.message(Err(error));
+                    self.refresh();
+                    return;
+                }
+            }
+        };
         self.busy = true;
         self.status = "正在处理文件…".into();
         let tx = self.tx.clone();
@@ -663,6 +839,21 @@ impl FolderApp {
                         pane.navigate(location, true);
                     }
                 }
+                Action::NewEmptyWorkspace => {
+                    self.active = self.workspace.new_empty_workspace();
+                }
+                Action::BindPane(id, paths) => {
+                    let tx = self.tx.clone();
+                    let ctx = ctx.clone();
+                    thread::spawn(move || {
+                        let result = paths
+                            .into_iter()
+                            .map(|path| files::resolve(&path))
+                            .collect();
+                        let _ = tx.send(Event::PanePaths(id, result));
+                        ctx.request_repaint();
+                    });
+                }
                 Action::NewPane(location) => {
                     let id = self.workspace.next_id;
                     self.workspace.next_id += 1;
@@ -671,33 +862,20 @@ impl FolderApp {
                         .push_to_focused_leaf(Pane::new(id, location));
                     self.active = id;
                 }
-                Action::Split(id, split) => {
-                    let found = self
-                        .workspace
-                        .dock
-                        .iter_all_tabs()
-                        .find(|(_, p)| p.id == id)
-                        .map(|(path, p)| (path, p.clone()));
-                    if let Some((path, pane)) = found {
-                        let next = self.workspace.next_id;
-                        self.workspace.next_id += 1;
-                        self.workspace.dock.split(
-                            NodePath {
-                                surface: path.surface,
-                                node: path.node,
-                            },
-                            split,
-                            0.5,
-                            egui_dock::Node::leaf(Pane::new(next, pane.location)),
-                        );
-                    }
-                }
                 Action::Choose(id) => self.chooser = Some(id),
                 Action::SystemMenu(paths) => {
+                    if let Err(error) = self
+                        .target_guards(&paths)
+                        .and_then(|g| files::validate_targets(&g))
+                    {
+                        self.message(Err(error));
+                        self.refresh();
+                        continue;
+                    }
                     if let Err(error) = crate::shell_menu::show(&paths) {
                         self.message(Err(error));
                     }
-                    self.cache.refresh();
+                    self.refresh();
                 }
                 Action::Open(path) => {
                     let tx = self.tx.clone();
@@ -718,14 +896,7 @@ impl FolderApp {
                     thread::spawn(move || {
                         let result = paths
                             .into_iter()
-                            .map(|path| {
-                                let canonical = fs::canonicalize(&path).map_err(|e| {
-                                    format!("无法添加 {}：{e}", display_path(&path))
-                                })?;
-                                let directory =
-                                    canonical.metadata().map_err(|e| e.to_string())?.is_dir();
-                                Ok((canonical, directory))
-                            })
+                            .map(|path| files::resolve(&path))
                             .collect();
                         let _ = tx.send(Event::Imported(id, result));
                         ctx.request_repaint();
@@ -788,6 +959,7 @@ impl FolderApp {
                 Action::RemoveVirtual(id) => {
                     self.workspace.root.remove(id);
                     self.revision += 1;
+                    self.refresh();
                     self.message(Ok("已移除虚拟引用；真实文件未删除".into()));
                 }
                 Action::MoveVirtual(id, destination) => {
@@ -808,13 +980,22 @@ impl FolderApp {
                     if result.is_ok() {
                         self.sidebar_open.insert(destination);
                         self.revision += 1;
+                        self.refresh();
                     }
                     self.message(result.map(|()| "已重新组织虚拟节点；真实文件未移动".into()));
                 }
                 Action::RenameReal(source) => {
+                    let guards = match self.target_guards(std::slice::from_ref(&source)) {
+                        Ok(guards) => guards,
+                        Err(error) => {
+                            self.message(Err(error));
+                            self.refresh();
+                            continue;
+                        }
+                    };
                     self.edit = Some(EditDialog {
                         name: path_name(&source),
-                        edit: Edit::RealName(source),
+                        edit: Edit::RealName(source, guards),
                         error: String::new(),
                         focus: true,
                     })
@@ -827,12 +1008,30 @@ impl FolderApp {
                         focus: true,
                     })
                 }
-                Action::DeleteReal(paths) => {
+                Action::DeleteReal(paths, permanent) => {
                     if !paths.is_empty() {
-                        self.delete = Some(paths);
+                        match self.target_guards(&paths) {
+                            Ok(guards) => self.delete = Some((paths, permanent, guards)),
+                            Err(error) => {
+                                self.message(Err(error));
+                                self.refresh();
+                            }
+                        }
                     }
                 }
                 Action::Copy(paths, moving) => {
+                    if moving {
+                        match self.target_guards(&paths) {
+                            Ok(guards) => self.cut_guards = guards,
+                            Err(error) => {
+                                self.message(Err(error));
+                                self.refresh();
+                                continue;
+                            }
+                        }
+                    } else {
+                        self.cut_guards.clear();
+                    }
                     self.message(crate::clipboard::write(&paths, moving).map(|()| {
                         format!(
                             "已{} {} 项，可在本程序或资源管理器中粘贴",
@@ -842,7 +1041,10 @@ impl FolderApp {
                     }));
                 }
                 Action::Paste(destination) => {
-                    self.operation(ctx, Operation::PasteClipboard(destination));
+                    self.operation(
+                        ctx,
+                        Operation::PasteClipboard(destination, self.cut_guards.clone()),
+                    );
                 }
                 Action::Transfer(sources, destination, moving) => {
                     self.operation(
@@ -854,13 +1056,14 @@ impl FolderApp {
                         },
                     );
                 }
-                Action::Refresh => self.cache.refresh(),
+                Action::Refresh => self.refresh(),
                 Action::Search(id, location, query) => {
                     if query.trim().is_empty() {
                         self.message(Err("请输入需要递归查找的名称。".into()));
                         continue;
                     }
                     let roots = match &location {
+                        Location::Empty => vec![],
                         Location::Disk(path) => vec![path.clone()],
                         Location::Virtual(id) => self
                             .workspace
@@ -876,7 +1079,9 @@ impl FolderApp {
                         .find(|(_, p)| p.id == id)
                     {
                         pane.rows.clear();
+                        pane.marquee = None;
                         pane.selected.clear();
+                        pane.anchor = None;
                         pane.row_stamp.clear();
                     }
                     self.searches.insert(
@@ -903,6 +1108,9 @@ impl FolderApp {
                     }
                 }
             }
+        }
+        if !self.actions.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -937,7 +1145,7 @@ impl FolderApp {
                         Edit::Virtual { file: true, .. } => "新建虚拟文件 · 一个名字，多个项目版本",
                         Edit::Virtual { .. } => "新建虚拟文件夹 · 只组织引用",
                         Edit::VirtualName(_) => "重命名虚拟节点",
-                        Edit::RealName(_) => "重命名真实文件 / 文件夹",
+                        Edit::RealName(..) => "重命名真实文件 / 文件夹",
                         Edit::RealNew {
                             directory: true, ..
                         } => "新建真实文件夹",
@@ -1006,12 +1214,15 @@ impl FolderApp {
                                     self.revision += 1;
                                 }
                             }
-                            Edit::RealName(path) => self.operation(
+                            Edit::RealName(path, guards) => self.operation(
                                 ctx,
-                                Operation::Rename {
-                                    source: path.clone(),
-                                    name: dialog.name.clone(),
-                                },
+                                Operation::Checked(
+                                    guards.clone(),
+                                    Box::new(Operation::Rename {
+                                        source: path.clone(),
+                                        name: dialog.name.clone(),
+                                    }),
+                                ),
                             ),
                             Edit::RealNew { parent, directory } => self.operation(
                                 ctx,
@@ -1030,19 +1241,24 @@ impl FolderApp {
                 self.edit = Some(dialog);
             }
         }
-        if let Some(paths) = self.delete.clone() {
+        if let Some((paths, permanent, guards)) = self.delete.clone() {
             let mut open = true;
             let mut confirmed = false;
-            egui::Window::new("移入回收站")
+            let title = if permanent {
+                "永久删除"
+            } else {
+                "移入回收站"
+            };
+            egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "将 {} 个真实文件 / 文件夹移入回收站？",
-                        paths.len()
-                    ));
+                    ui.label(format!("将 {} 个真实文件 / 文件夹{}？", paths.len(), title));
+                    if permanent {
+                        ui.colored_label(Color32::LIGHT_RED, "不经过回收站，此操作无法撤销。");
+                    }
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
                         .show(ui, |ui| {
@@ -1051,11 +1267,28 @@ impl FolderApp {
                             }
                         });
                     confirmed = ui
-                        .add_enabled(!self.busy, egui::Button::new("移入回收站"))
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(RichText::new(title).color(if permanent {
+                                Color32::LIGHT_RED
+                            } else {
+                                ui.visuals().text_color()
+                            })),
+                        )
                         .clicked();
                 });
             if confirmed {
-                self.operation(ctx, Operation::Trash(paths));
+                self.operation(
+                    ctx,
+                    Operation::Checked(
+                        guards,
+                        Box::new(if permanent {
+                            Operation::PermanentDelete(paths)
+                        } else {
+                            Operation::Trash(paths)
+                        }),
+                    ),
+                );
                 self.delete = None;
             } else if !open {
                 self.delete = None;
@@ -1125,6 +1358,7 @@ impl FolderApp {
                 {
                     paths.remove(index);
                     self.revision += 1;
+                    self.refresh();
                 }
                 if !open {
                     self.chooser = None;
@@ -1228,17 +1462,17 @@ impl eframe::App for FolderApp {
                 );
                 drag_title_bar(&title);
                 ui.add_space(12.0);
-                if ui.add(egui::Button::new("打开目录").frame(false)).clicked() {
+                if tool_button(ui, Icon::OpenFolder, "打开目录", [30.0, 26.0]).clicked() {
                     self.actions.push(Action::PickDirectory);
                 }
-                if ui
-                    .add(egui::Button::new("＋ 工作区面板").frame(false))
-                    .clicked()
-                {
-                    self.actions.push(Action::NewPane(Location::Virtual(0)));
+                if tool_button(ui, Icon::NewPane, "新增工作区面板", [30.0, 26.0]).clicked() {
+                    self.actions.push(Action::NewEmptyWorkspace);
                 }
-                if ui.add(egui::Button::new("刷新  F5").frame(false)).clicked() {
-                    self.actions.push(Action::Refresh);
+                if tool_button(ui, Icon::Search, "全电脑搜索", [30.0, 26.0]).clicked() {
+                    let cache = self
+                        .writable
+                        .then(|| self.config.with_file_name("file-index.bin"));
+                    self.global_search.open(cache, &ctx);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -1323,6 +1557,7 @@ impl eframe::App for FolderApp {
                             "{} 面板",
                             self.workspace.dock.iter_all_tabs().count()
                         ));
+                        ui.weak(crate::backend::status());
                         if !self.writable {
                             ui.colored_label(Color32::YELLOW, "配置只读");
                         }
@@ -1330,74 +1565,138 @@ impl eframe::App for FolderApp {
                 });
             });
         egui::Panel::left("library")
+            .frame(
+                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(2, 0)),
+            )
             .default_size(250.0)
             .min_size(190.0)
             .resizable(true)
             .show(ui, |ui| {
-                ui.add_space(9.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("虚拟资源").strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if tool_button(ui, Icon::NewFile, "新建虚拟文件", [25.0, 25.0]).clicked()
-                        {
-                            self.actions.push(Action::NewVirtual(0, true));
-                        }
-                        if tool_button(ui, Icon::NewFolder, "新建虚拟文件夹", [25.0, 25.0])
-                            .clicked()
-                        {
-                            self.actions.push(Action::NewVirtual(0, false));
-                        }
-                    });
-                });
+                let sidebar_height = (ui.available_height() - 12.0).max(1.0);
+                let split_id = Id::new("sidebar-split-ratio");
+                let ratio = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<f32>(split_id))
+                    .unwrap_or(0.8);
+                let workspace_height = sidebar_height * ratio;
+                let (workspace_rect, _) = ui.allocate_exact_size(
+                    Vec2::new(ui.available_width(), workspace_height),
+                    Sense::hover(),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(workspace_rect.shrink2(Vec2::new(10.0, 14.0))),
+                    |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(6, 0))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.sidebar_filter)
+                                        .hint_text("搜索虚拟工作区…")
+                                        .desired_width(ui.available_width()),
+                                );
+                            });
+                        let query = self.sidebar_filter.trim().to_lowercase();
+                        let filtered = self.sidebar_search.filter(
+                            &self.workspace.root,
+                            &query,
+                            &self.sidebar_open,
+                        );
+                        let root = if query.is_empty() {
+                            Some(&self.workspace.root)
+                        } else {
+                            filtered.as_ref()
+                        };
+                        let expanded = if query.is_empty() {
+                            &mut self.sidebar_open
+                        } else {
+                            &mut self.sidebar_search.expanded
+                        };
+                        let tree_height =
+                            (ui.available_height() - 48.0 - ui.spacing().item_spacing.y).max(0.0);
+                        let tree = egui::ScrollArea::vertical()
+                            .id_salt("library-scroll")
+                            .auto_shrink([false, false])
+                            .max_height(tree_height)
+                            .show(ui, |ui| {
+                                if let Some(Node {
+                                    kind: Kind::Folder(children),
+                                    ..
+                                }) = root
+                                {
+                                    for child in children {
+                                        library_node(ui, child, 0, expanded, &mut self.actions);
+                                    }
+                                } else {
+                                    ui.weak("没有匹配的工作区或引用");
+                                }
+                            });
+                        let mut blank = tree.inner_rect;
+                        blank.min.y = (blank.top() + tree.content_size.y - tree.state.offset.y)
+                            .clamp(blank.top(), blank.bottom());
+                        workspace_root_drop(ui, blank, &mut self.actions);
+                        let target = egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(6, 0))
+                            .show(ui, |ui| drop_target(ui, 0, &mut self.actions))
+                            .inner;
+                        virtual_menu(&target, &self.workspace.root, &mut self.actions, || {
+                            self.workspace.root.real_paths()
+                        });
+                    },
+                );
+                paint_workspace_border(ui, workspace_rect);
+                let split_rect = egui::Rect::from_min_max(
+                    egui::pos2(workspace_rect.left() + 8.0, workspace_rect.bottom() - 11.0),
+                    egui::pos2(workspace_rect.right() - 8.0, workspace_rect.bottom() - 5.0),
+                );
+                let split = ui.interact(split_rect, split_id.with("handle"), Sense::drag());
+                let split = split.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                if split.hovered() || split.dragged() {
+                    ui.painter().hline(
+                        split_rect.x_range(),
+                        split_rect.center().y,
+                        egui::Stroke::new(2.0, ui.visuals().hyperlink_color),
+                    );
+                }
+                if split.dragged() {
+                    let ratio = (ratio + split.drag_delta().y / sidebar_height).clamp(0.15, 0.9);
+                    ui.ctx().data_mut(|d| d.insert_temp(split_id, ratio));
+                }
                 ui.add_space(8.0);
                 egui::ScrollArea::vertical()
-                    .id_salt("library-scroll")
+                    .id_salt("locations-scroll")
+                    .max_height(ui.available_height())
                     .show(ui, |ui| {
-                        library_node(
-                            ui,
-                            &self.workspace.root,
-                            0,
-                            &mut self.sidebar_open,
-                            &mut self.actions,
-                        );
+                        if let Some(home) = std::env::var_os("USERPROFILE") {
+                            location_tree(
+                                ui,
+                                Path::new(&home),
+                                "用户目录",
+                                Icon::Home,
+                                &mut self.cache,
+                                &mut self.actions,
+                            );
+                        }
+                        #[cfg(windows)]
+                        for letter in drive_letters() {
+                            let path = PathBuf::from(format!("{letter}:/"));
+                            location_tree(
+                                ui,
+                                &path,
+                                &display_path(&path),
+                                Icon::Drive,
+                                &mut self.cache,
+                                &mut self.actions,
+                            );
+                        }
                     });
-                ui.add_space(12.0);
-                drop_target(ui, 0, &mut self.actions);
-                ui.separator();
-                ui.label(
-                    RichText::new("磁盘与位置")
-                        .size(12.0)
-                        .color(ui.visuals().weak_text_color()),
-                );
-                if let Some(home) = std::env::var_os("USERPROFILE")
-                    && icon_button(ui, "用户目录", Icon::Home, ui.visuals().weak_text_color())
-                        .clicked()
-                {
-                    self.actions
-                        .push(Action::NewPane(Location::Disk(home.into())));
-                }
-                // GetLogicalDrives avoids probing disconnected/network drives on the UI thread.
-                #[cfg(windows)]
-                for letter in drive_letters() {
-                    if icon_button(
-                        ui,
-                        &format!("{letter}:/"),
-                        Icon::Drive,
-                        ui.visuals().weak_text_color(),
-                    )
-                    .clicked()
-                    {
-                        self.actions
-                            .push(Action::NewPane(Location::Disk(PathBuf::from(format!(
-                                "{letter}:/"
-                            )))));
-                    }
-                }
             });
-        let modal =
-            self.edit.is_some() || self.delete.is_some() || self.chooser.is_some() || self.help;
+        let modal = self.edit.is_some()
+            || self.delete.is_some()
+            || self.chooser.is_some()
+            || self.help
+            || self.global_search.open;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
             .show(ui, |ui| {
                 let mut viewer = Viewer {
                     root: &self.workspace.root,
@@ -1421,7 +1720,7 @@ impl eframe::App for FolderApp {
                     .show_inside(ui, &mut viewer);
             });
         if !modal && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.cache.refresh();
+            self.actions.push(Action::Refresh);
         }
         if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
             ctx.input_mut(|i| i.raw.dropped_files.clear());
@@ -1430,6 +1729,20 @@ impl eframe::App for FolderApp {
             ));
         }
         self.dialogs(&ctx);
+        if let Some(selection) = self.global_search.show(&ctx) {
+            use crate::global_search::Selection;
+            match selection {
+                Selection::Open(hit) if !hit.directory => self.actions.push(Action::Open(hit.path)),
+                Selection::Open(hit) | Selection::Locate(hit) => {
+                    let id = self.workspace.next_id;
+                    self.workspace.next_id += 1;
+                    let mut pane = Pane::new(id, Location::Empty);
+                    bind_real_path(&mut pane, hit.path, hit.directory);
+                    self.workspace.dock.push_to_focused_leaf(pane);
+                    self.active = id;
+                }
+            }
+        }
         self.act(&ctx);
         let drag_label = ctx
             .data(|d| d.get_temp::<String>(Id::new("disk-drop-hint")))
@@ -1473,9 +1786,13 @@ impl eframe::App for FolderApp {
                     && crate::drag_drop::buttons().0
                 {
                     egui::DragAndDrop::clear_payload(&ctx);
-                    self.message(crate::drag_drop::drag_out(self.native_window, &paths));
+                    let result = self
+                        .target_guards(&paths)
+                        .and_then(|g| files::validate_targets(&g))
+                        .and_then(|()| crate::drag_drop::drag_out(self.native_window, &paths));
+                    self.message(result);
                     self.release_native_drag = true;
-                    self.cache.refresh();
+                    self.refresh();
                     ctx.request_repaint();
                 }
             }
@@ -1593,6 +1910,32 @@ fn drive_letters() -> Vec<char> {
         .collect()
 }
 
+fn bind_real_path(pane: &mut Pane, path: PathBuf, directory: bool) {
+    let destination = if directory {
+        path.clone()
+    } else {
+        path.parent().unwrap_or(&path).to_path_buf()
+    };
+    pane.navigate(Location::Disk(destination), false);
+    if !directory {
+        pane.pending_selection = Some(format!("p:{}", path.display()));
+    }
+}
+
+fn accept_empty_drop(response: &egui::Response, id: u64, actions: &mut Vec<Action>) {
+    if response.dnd_hover_payload::<VirtualDrag>().is_some() {
+        return;
+    }
+    // Reuse hover feedback and single-consumption handling, but bind instead of importing.
+    let mut dropped = Vec::new();
+    accept_drop(response, id, &mut dropped);
+    for action in dropped {
+        if let Action::Import(_, paths) = action {
+            actions.push(Action::BindPane(id, paths));
+        }
+    }
+}
+
 fn accept_drop(response: &egui::Response, id: u64, actions: &mut Vec<Action>) {
     if response.contains_pointer() {
         let paths: Vec<_> = response.ctx.input(|i| {
@@ -1688,17 +2031,195 @@ fn accept_disk_drop(response: &egui::Response, destination: &Path, actions: &mut
     }
 }
 
-fn drop_target(ui: &mut egui::Ui, id: u64, actions: &mut Vec<Action>) {
+fn location_tree(
+    ui: &mut egui::Ui,
+    path: &Path,
+    label: &str,
+    icon: Icon,
+    cache: &mut DirectoryCache,
+    actions: &mut Vec<Action>,
+) {
+    egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        ui.make_persistent_id(("location-tree", path)),
+        false,
+    )
+    .show_header(ui, |ui| {
+        let response = icon_button(ui, label, icon, ui.visuals().text_color());
+        if response.clicked() {
+            actions.push(Action::NewPane(Location::Disk(path.into())));
+        }
+        response.context_menu(|ui| {
+            if ui.button("在 Windows 文件管理器中打开").clicked() {
+                actions.push(Action::Open(path.into()));
+                ui.close();
+            }
+        });
+    })
+    .body(|ui| {
+        cache.request(path);
+        match cache.entries.get(path) {
+            Some(Listing::Ready(entries)) => {
+                let directories: Vec<_> = entries.iter().filter(|e| e.directory).cloned().collect();
+                for entry in directories {
+                    if entry.link {
+                        if icon_button(ui, &entry.name, Icon::Folder, ui.visuals().text_color())
+                            .clicked()
+                        {
+                            actions.push(Action::NewPane(Location::Disk(entry.path)));
+                        }
+                    } else {
+                        location_tree(ui, &entry.path, &entry.name, Icon::Folder, cache, actions);
+                    }
+                }
+            }
+            Some(Listing::Error(error)) => {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            _ => {
+                ui.spinner();
+            }
+        }
+    });
+}
+
+#[derive(Default)]
+struct WorkspaceSearch {
+    query: String,
+    expanded: HashSet<u64>,
+}
+
+impl WorkspaceSearch {
+    fn filter(&mut self, root: &Node, query: &str, normal_expanded: &HashSet<u64>) -> Option<Node> {
+        let mut initial_expanded = normal_expanded.clone();
+        let result = if query.is_empty() {
+            None
+        } else {
+            filter_workspace(root, query, &mut initial_expanded)
+        };
+        if self.query != query {
+            self.query = query.into();
+            self.expanded = initial_expanded;
+        }
+        result
+    }
+}
+
+fn filter_workspace(node: &Node, query: &str, expanded: &mut HashSet<u64>) -> Option<Node> {
+    if node.id != 0 && node.name.to_lowercase().contains(query) {
+        return Some(node.clone());
+    }
+    if let Kind::Folder(children) = &node.kind {
+        let children: Vec<_> = children
+            .iter()
+            .filter_map(|child| filter_workspace(child, query, expanded))
+            .collect();
+        if !children.is_empty() {
+            expanded.insert(node.id);
+            return Some(Node {
+                id: node.id,
+                name: node.name.clone(),
+                kind: Kind::Folder(children),
+            });
+        }
+    }
+    None
+}
+
+fn paint_workspace_border(ui: &egui::Ui, rect: egui::Rect) {
+    let rect = rect.shrink(8.0);
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    let phase = ui.input(|i| (i.time / 10.0).fract()) as f32;
+    let mut mesh = egui::Mesh::default();
+    for (side, pair) in corners.windows(2).enumerate() {
+        // Shared miter offsets join adjacent strips without gaps or overlapping corners.
+        let offsets = [
+            Vec2::new(-1.0, -1.0),
+            Vec2::new(1.0, -1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(-1.0, 1.0),
+            Vec2::new(-1.0, -1.0),
+        ];
+        for step in 0..24 {
+            let color_at = |t: f32| {
+                Color32::from(egui::ecolor::Hsva::new(
+                    (side as f32 / 4.0 + t / 4.0 - phase).rem_euclid(1.0),
+                    0.65,
+                    if ui.visuals().dark_mode { 0.95 } else { 0.75 },
+                    1.0,
+                ))
+            };
+            let start = step as f32 / 24.0;
+            let end = (step + 1) as f32 / 24.0;
+            // Interpolate opacity across the halo, avoiding hard bands around the bright core.
+            let profile = [
+                (-8.0, 0.0),
+                (-5.0, 0.04),
+                (-3.0, 0.12),
+                (-1.0, 0.4),
+                (-0.5, 1.0),
+                (0.5, 1.0),
+                (1.0, 0.4),
+                (3.0, 0.12),
+                (5.0, 0.04),
+                (8.0, 0.0),
+            ];
+            for band in profile.windows(2) {
+                let base = mesh.vertices.len() as u32;
+                for (t, (offset, alpha)) in [
+                    (start, band[0]),
+                    (start, band[1]),
+                    (end, band[1]),
+                    (end, band[0]),
+                ] {
+                    mesh.colored_vertex(
+                        pair[0].lerp(pair[1], t)
+                            + (offsets[side] * (1.0 - t) + offsets[side + 1] * t) * offset,
+                        color_at(t).gamma_multiply(alpha),
+                    );
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
+    if ui.input(|i| i.viewport().focused == Some(true) && i.viewport().minimized != Some(true)) {
+        ui.ctx().request_repaint();
+    }
+}
+
+fn workspace_root_drop(ui: &egui::Ui, rect: egui::Rect, actions: &mut Vec<Action>) {
+    let response = ui.interact(rect, ui.id().with("workspace-root-drop"), Sense::hover());
+    accept_drop(&response, 0, actions);
+}
+
+fn drop_target(ui: &mut egui::Ui, id: u64, actions: &mut Vec<Action>) -> egui::Response {
     let response = ui.add_sized(
         [ui.available_width(), 48.0],
         egui::Button::new(
-            RichText::new("＋ 拖入文件 / 文件夹\n仅添加路径引用")
-                .size(12.0)
-                .color(ui.visuals().weak_text_color()),
+            RichText::new(
+                if id == 0 && egui::DragAndDrop::has_payload_of_type::<VirtualDrag>(ui.ctx()) {
+                    "拖到此处\n移回工作区顶层"
+                } else if id == 0 {
+                    "拖入文件 / 文件夹\n创建虚拟工作区"
+                } else {
+                    "拖入文件 / 文件夹\n仅添加路径引用"
+                },
+            )
+            .size(12.0)
+            .color(ui.visuals().weak_text_color()),
         )
-        .sense(Sense::hover()),
+        .sense(Sense::click()),
     );
     accept_drop(&response, id, actions);
+    response
 }
 
 fn library_node(
@@ -1835,6 +2356,10 @@ fn virtual_menu(
             ui.close();
         }
         if node.id != 0 {
+            if ui.button("移回工作区顶层").clicked() {
+                actions.push(Action::MoveVirtual(node.id, 0));
+                ui.close();
+            }
             if ui.button("重命名虚拟节点").clicked() {
                 actions.push(Action::RenameVirtual(node.id));
                 ui.close();
@@ -1861,6 +2386,7 @@ impl TabViewer for Viewer<'_> {
     type Tab = Pane;
     fn title(&mut self, pane: &mut Pane) -> egui::WidgetText {
         match &pane.location {
+            Location::Empty => "空工作区".into(),
             Location::Disk(p) => path_name(p),
             Location::Virtual(id) => self
                 .root
@@ -1877,19 +2403,53 @@ impl TabViewer for Viewer<'_> {
         [false, false]
     }
     fn on_tab_button(&mut self, pane: &mut Pane, response: &egui::Response) {
+        response.ctx.data_mut(|data| {
+            data.insert_temp(
+                Id::new(("tab-underline", pane.id)),
+                (response.interact_rect, response.layer_id),
+            );
+        });
         if response.clicked() {
             *self.active = pane.id;
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, pane: &mut Pane) {
+        // Dock calls ui only for the selected tab in each visible pane.
+        if let Some((rect, layer)) = ui.ctx().data(|data| {
+            data.get_temp::<(egui::Rect, egui::LayerId)>(Id::new(("tab-underline", pane.id)))
+        }) {
+            let underline = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.bottom() - 3.0),
+                rect.right_bottom(),
+            );
+            ui.ctx()
+                .layer_painter(layer)
+                .rect_filled(underline, 0.0, ui.visuals().hyperlink_color);
+        }
+        if pane.location == Location::Empty {
+            let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "拖入文件或文件夹\n打开真实路径",
+                egui::FontId::proportional(16.0),
+                ui.visuals().weak_text_color(),
+            );
+            accept_empty_drop(&response, pane.id, self.actions);
+            return;
+        }
         let mut text_submitted = false;
+        let mut focus_search = false;
         if ui.rect_contains_pointer(ui.max_rect()) && ui.input(|i| i.pointer.any_pressed()) {
             *self.active = pane.id;
         }
         ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size = Vec2::splat(22.0);
+            ui.spacing_mut().button_padding = Vec2::new(2.0, 0.0);
+            ui.spacing_mut().item_spacing.x = 2.0;
             if ui
                 .add_enabled_ui(!pane.history.is_empty(), |ui| {
-                    tool_button(ui, Icon::Back, "后退 Alt+←", [26.0, 25.0])
+                    tool_button(ui, Icon::Back, "后退 Alt+←", [22.0, 22.0])
                 })
                 .inner
                 .clicked()
@@ -1898,30 +2458,81 @@ impl TabViewer for Viewer<'_> {
             }
             if ui
                 .add_enabled_ui(!pane.forward.is_empty(), |ui| {
-                    tool_button(ui, Icon::Forward, "前进 Alt+→", [26.0, 25.0])
+                    tool_button(ui, Icon::Forward, "前进 Alt+→", [22.0, 22.0])
                 })
                 .inner
                 .clicked()
             {
                 forward(pane);
             }
-            if tool_button(ui, Icon::Up, "上一级", [26.0, 25.0]).clicked() {
+            if tool_button(ui, Icon::Up, "上一级", [22.0, 22.0]).clicked() {
                 up(pane, self.root);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if split_button(ui, true).clicked() {
-                    self.actions.push(Action::Split(pane.id, Split::Below));
+            for (directory, icon, label) in [
+                (true, Icon::NewFolder, "新建文件夹"),
+                (false, Icon::NewFile, "新建文件"),
+            ] {
+                if tool_button(ui, icon, label, [22.0, 22.0]).clicked() {
+                    self.actions.push(match &pane.location {
+                        Location::Empty => return,
+                        Location::Disk(path) => Action::NewReal(path.clone(), directory),
+                        Location::Virtual(id) => Action::NewVirtual(*id, !directory),
+                    });
                 }
-                if split_button(ui, false).clicked() {
-                    self.actions.push(Action::Split(pane.id, Split::Right));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let previous = pane.sort;
+                ui.push_id(("pane-sort", pane.id), |ui| {
+                    let button = tool_button(
+                        ui,
+                        Icon::Sort,
+                        &format!("排序：{}", pane.sort.label()),
+                        [28.0, 22.0],
+                    );
+                    egui::Popup::menu(&button).show(|ui| {
+                        for order in [SortOrder::Type, SortOrder::Name, SortOrder::Modified] {
+                            if ui
+                                .selectable_value(&mut pane.sort, order, order.label())
+                                .clicked()
+                            {
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if previous != pane.sort {
+                    pane.row_stamp.clear();
+                    pane.anchor = None;
+                    pane.marquee = None;
+                    if self.searches.contains_key(&pane.id) {
+                        pane.sort.sort_results(&mut pane.rows);
+                    }
+                }
+                if tool_button(
+                    ui,
+                    Icon::Search,
+                    if pane.search_visible {
+                        "收起搜索"
+                    } else {
+                        "展开搜索"
+                    },
+                    [28.0, 22.0],
+                )
+                .clicked()
+                {
+                    pane.search_visible = !pane.search_visible;
+                    focus_search = pane.search_visible;
                 }
                 ui.allocate_ui_with_layout(
                     Vec2::new(ui.available_width(), 22.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| match &pane.location {
+                        Location::Empty => {}
                         Location::Disk(_) => {
-                            let address = ui.add(
+                            let address = ui.add_sized(
+                                [ui.available_width(), 22.0],
                                 egui::TextEdit::singleline(&mut pane.address)
+                                    .margin(Vec2::new(4.0, 2.0))
                                     .desired_width(ui.available_width())
                                     .hint_text("目录路径 · Enter"),
                             );
@@ -1935,40 +2546,54 @@ impl TabViewer for Viewer<'_> {
                             }
                         }
                         Location::Virtual(id) => {
-                            if ui.small_button("＋夹").clicked() {
-                                self.actions.push(Action::NewVirtual(*id, false));
-                            }
-                            if ui.small_button("＋文件").clicked() {
-                                self.actions.push(Action::NewVirtual(*id, true));
-                            }
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!(
-                                        "虚拟 / {}",
-                                        self.root
-                                            .find(*id)
-                                            .map(|n| n.name.as_str())
-                                            .unwrap_or("已移除")
-                                    ))
-                                    .color(ui.visuals().hyperlink_color),
-                                )
-                                .truncate(),
+                            let text = format!(
+                                "虚拟 / {}",
+                                self.root
+                                    .find(*id)
+                                    .map(|n| n.name.as_str())
+                                    .unwrap_or("已移除")
                             );
+                            let mut job = egui::text::LayoutJob::default();
+                            let count = text.chars().count().saturating_sub(1).max(1) as f32;
+                            for (index, ch) in text.chars().enumerate() {
+                                let color = Color32::from(egui::ecolor::Hsva::new(
+                                    0.48 + 0.42 * index as f32 / count,
+                                    if ui.visuals().dark_mode { 0.55 } else { 0.85 },
+                                    if ui.visuals().dark_mode { 1.0 } else { 0.6 },
+                                    1.0,
+                                ));
+                                job.append(
+                                    &ch.to_string(),
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: egui::FontId::proportional(14.0),
+                                        color,
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            ui.add(egui::Label::new(job).truncate()).on_hover_text(text);
                         }
                     },
                 );
             });
         });
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut pane.filter)
-                .hint_text("搜索名称…（含子目录）")
-                .desired_width(f32::INFINITY),
-        );
-        if response.changed() {
-            pane.search_deadline = Some(Instant::now() + Duration::from_millis(300));
-            ui.ctx().request_repaint_after(Duration::from_millis(300));
+        let mut enter = false;
+        if pane.search_visible {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut pane.filter)
+                    .hint_text("搜索名称…（含子目录）")
+                    .desired_width(f32::INFINITY),
+            );
+            if focus_search {
+                response.request_focus();
+            }
+            if response.changed() {
+                pane.search_deadline = Some(Instant::now() + Duration::from_millis(300));
+                ui.ctx().request_repaint_after(Duration::from_millis(300));
+            }
+            enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         }
-        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if enter
             || pane
                 .search_deadline
@@ -1987,6 +2612,9 @@ impl TabViewer for Viewer<'_> {
             .get(&pane.id)
             .filter(|s| s.location == pane.location);
         if let Some(search) = searching {
+            if let Some(error) = &search.watch_error {
+                ui.colored_label(Color32::YELLOW, format!("自动刷新不可用，请按 F5：{error}"));
+            }
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!(
@@ -2029,6 +2657,7 @@ impl TabViewer for Viewer<'_> {
         );
         if searching.is_none() && pane.row_stamp != stamp {
             pane.rows.clear();
+            pane.marquee = None;
             collect_rows(
                 &pane.location,
                 0,
@@ -2036,9 +2665,17 @@ impl TabViewer for Viewer<'_> {
                 self.cache,
                 &pane.expanded,
                 &mut pane.rows,
+                pane.sort,
             );
             let live_keys: HashSet<_> = pane.rows.iter().map(|r| &r.key).collect();
             pane.selected.retain(|key| live_keys.contains(key));
+            if pane
+                .pending_selection
+                .as_ref()
+                .is_some_and(|key| live_keys.contains(key))
+            {
+                pane.selected.insert(pane.pending_selection.take().unwrap());
+            }
             pane.row_stamp = stamp;
         }
         if let Location::Disk(path) = &pane.location {
@@ -2055,13 +2692,30 @@ impl TabViewer for Viewer<'_> {
                 _ => {}
             }
         }
-        let bottom = 32.0;
+        let bottom = 28.0;
         let available_height = (ui.available_height() - bottom).max(30.0);
+        let background = ui.interact(
+            egui::Rect::from_min_size(
+                ui.cursor().min,
+                Vec2::new(ui.available_width(), available_height),
+            ),
+            ui.id().with(("marquee", pane.id)),
+            if self.modal {
+                Sense::hover()
+            } else {
+                Sense::click_and_drag()
+            },
+        );
+        let stride = ROW_HEIGHT + ui.spacing().item_spacing.y;
         let scroll = egui::ScrollArea::vertical()
             .id_salt(("tree", pane.id))
+            .scroll_source(
+                egui::scroll_area::ScrollSource::SCROLL_BAR
+                    | egui::scroll_area::ScrollSource::MOUSE_WHEEL,
+            )
             .auto_shrink([false, false])
             .max_height(available_height);
-        let list = scroll.show_rows(ui, ROW_HEIGHT, pane.rows.len(), |ui, range| {
+        let mut list = scroll.show_rows(ui, ROW_HEIGHT, pane.rows.len(), |ui, range| {
             for index in range {
                 let row = pane.rows[index].clone();
                 let response = draw_row(
@@ -2070,9 +2724,6 @@ impl TabViewer for Viewer<'_> {
                     pane.selected.contains(&row.key),
                     pane.expanded.contains(&row.key),
                 );
-                if searching.is_some() && response.hovered() {
-                    response.clone().on_hover_text(&row.detail);
-                }
                 if response.clicked() {
                     let modifiers = ui.input(|i| i.modifiers);
                     if row.directory
@@ -2113,6 +2764,7 @@ impl TabViewer for Viewer<'_> {
                                     .iter()
                                     .filter(|r| pane.selected.contains(&r.key))
                                     .flat_map(|r| match &r.target {
+                                        Location::Empty => vec![],
                                         Location::Disk(path) => vec![path.clone()],
                                         Location::Virtual(id) => self
                                             .root
@@ -2160,11 +2812,38 @@ impl TabViewer for Viewer<'_> {
                 }
             }
         });
+        background.context_menu(|ui| {
+            let directories = explorer_directories(&pane.location, self.root);
+            let label = "在 Windows 文件管理器中打开";
+            if directories.len() == 1 {
+                if ui.button(label).clicked() {
+                    self.actions.push(Action::Open(directories[0].clone()));
+                    ui.close();
+                }
+            } else if directories.is_empty() {
+                ui.add_enabled(false, egui::Button::new(label))
+                    .on_disabled_hover_text("此虚拟面板没有实际目录");
+            } else {
+                ui.menu_button(label, |ui| {
+                    for path in directories {
+                        if ui.button(display_path(&path)).clicked() {
+                            self.actions.push(Action::Open(path));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+        marquee_selection(ui, pane, &background, &mut list, stride, self.modal);
         if pane.rows.is_empty() {
             ui.painter().text(
                 list.inner_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "此处为空，或没有匹配项",
+                if pane.filter.is_empty() && matches!(pane.location, Location::Virtual(_)) {
+                    "拖入文件或文件夹\n创建路径引用"
+                } else {
+                    "此处为空，或没有匹配项"
+                },
                 egui::FontId::proportional(14.0),
                 ui.visuals().weak_text_color(),
             );
@@ -2186,36 +2865,7 @@ impl TabViewer for Viewer<'_> {
             accept_disk_drop(&background, path, self.actions);
         }
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{} 项  ·  选中 {}",
-                    pane.rows.len(),
-                    pane.selected.len()
-                ))
-                .size(11.0)
-                .color(ui.visuals().weak_text_color()),
-            );
-            match &pane.location {
-                Location::Virtual(id) => {
-                    let response = ui.add(egui::Button::new(
-                        RichText::new("拖入引用 / 添加…").size(11.0),
-                    ));
-                    if response.clicked() {
-                        self.actions.push(Action::PickImport(*id, false));
-                    }
-                    accept_drop(&response, *id, self.actions);
-                }
-                Location::Disk(path) => {
-                    if ui.small_button("新建夹").clicked() {
-                        self.actions.push(Action::NewReal(path.clone(), true));
-                    }
-                    if ui.small_button("粘贴").clicked() {
-                        self.actions.push(Action::Paste(path.clone()));
-                    }
-                }
-            }
-        });
+        selection_footer(ui, pane, self.root, (self.cache.revision, self.revision));
         if *self.active == pane.id
             && !self.modal
             && !ui.ctx().egui_wants_keyboard_input()
@@ -2226,6 +2876,48 @@ impl TabViewer for Viewer<'_> {
     }
 }
 
+fn explorer_directories(location: &Location, root: &Node) -> Vec<PathBuf> {
+    fn collect(node: &Node, paths: &mut Vec<PathBuf>) {
+        match &node.kind {
+            Kind::Folder(children) => {
+                for child in children {
+                    collect(child, paths);
+                }
+            }
+            Kind::Link {
+                path,
+                directory: true,
+            } => paths.push(path.clone()),
+            Kind::Link {
+                path,
+                directory: false,
+            } => {
+                if let Some(parent) = path.parent() {
+                    paths.push(parent.into());
+                }
+            }
+            Kind::File(files) => paths.extend(
+                files
+                    .iter()
+                    .filter_map(|p| p.parent().map(Path::to_path_buf)),
+            ),
+        }
+    }
+    let mut paths = vec![];
+    match location {
+        Location::Empty => {}
+        Location::Disk(path) => paths.push(path.clone()),
+        Location::Virtual(id) => {
+            if let Some(node) = root.find(*id) {
+                collect(node, &mut paths);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn collect_rows(
     location: &Location,
     depth: usize,
@@ -2233,14 +2925,19 @@ fn collect_rows(
     cache: &mut DirectoryCache,
     expanded: &HashSet<String>,
     rows: &mut Vec<Row>,
+    sort: SortOrder,
 ) {
     match location {
+        Location::Empty => {}
         Location::Disk(path) => {
             cache.request(path);
-            let entries = match cache.entries.get(path) {
+            let mut entries = match cache.entries.get(path) {
                 Some(Listing::Ready(entries)) => entries.clone(),
                 _ => return,
             };
+            if sort != SortOrder::Name {
+                entries.sort_by_cached_key(|e| sort.key(&e.name, e.directory, e.modified));
+            }
             for entry in entries {
                 let key = format!("p:{}", entry.path.display());
                 let target = Location::Disk(entry.path.clone());
@@ -2250,6 +2947,7 @@ fn collect_rows(
                     display_path(&entry.path)
                 };
                 rows.push(Row {
+                    modified: entry.modified,
                     key: key.clone(),
                     name: entry.name,
                     depth,
@@ -2259,7 +2957,7 @@ fn collect_rows(
                     detail,
                 });
                 if entry.directory && expanded.contains(&key) {
-                    collect_rows(&target, depth + 1, root, cache, expanded, rows);
+                    collect_rows(&target, depth + 1, root, cache, expanded, rows, sort);
                 }
             }
         }
@@ -2269,7 +2967,36 @@ fn collect_rows(
                 ..
             }) = root.find(*id)
             {
-                for node in children {
+                let mut children: Vec<_> = children
+                    .iter()
+                    .map(|node| {
+                        let modified = if sort == SortOrder::Modified {
+                            match &node.kind {
+                                Kind::Folder(_) => None,
+                                _ => node
+                                    .real_paths()
+                                    .iter()
+                                    .filter_map(|p| cache.modified(p))
+                                    .max(),
+                            }
+                        } else {
+                            None
+                        };
+                        let directory = matches!(
+                            node.kind,
+                            Kind::Folder(_)
+                                | Kind::Link {
+                                    directory: true,
+                                    ..
+                                }
+                        );
+                        (node, modified, directory)
+                    })
+                    .collect();
+                children.sort_by_cached_key(|(node, modified, directory)| {
+                    sort.key(&node.name, *directory, *modified)
+                });
+                for (node, modified, _) in children {
                     let key = format!("v:{}", node.id);
                     let (directory, virtual_file, detail) = match &node.kind {
                         Kind::Folder(c) => (true, false, format!("虚拟文件夹 · {} 项", c.len())),
@@ -2285,6 +3012,7 @@ fn collect_rows(
                         ),
                     };
                     rows.push(Row {
+                        modified,
                         key: key.clone(),
                         name: node.name.clone(),
                         depth,
@@ -2299,7 +3027,7 @@ fn collect_rows(
                         } else {
                             Location::Virtual(node.id)
                         };
-                        collect_rows(&target, depth + 1, root, cache, expanded, rows);
+                        collect_rows(&target, depth + 1, root, cache, expanded, rows, sort);
                     }
                 }
             }
@@ -2307,11 +3035,191 @@ fn collect_rows(
     }
 }
 
+fn marquee_selection(
+    ui: &egui::Ui,
+    pane: &mut Pane,
+    background: &egui::Response,
+    list: &mut egui::scroll_area::ScrollAreaOutput<()>,
+    stride: f32,
+    modal: bool,
+) {
+    if modal {
+        pane.marquee = None;
+        return;
+    }
+    if background.clicked() && !ui.input(|i| i.modifiers.ctrl || i.modifiers.shift) {
+        pane.selected.clear();
+        pane.anchor = None;
+    }
+    if background.drag_started_by(egui::PointerButton::Primary)
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        && list.inner_rect.contains(origin)
+    {
+        pane.marquee = Some(Marquee {
+            origin: origin - list.inner_rect.min.to_vec2() + egui::vec2(0.0, list.state.offset.y),
+            before: pane.selected.clone(),
+            anchor: pane.anchor,
+            additive: ui.input(|i| i.modifiers.ctrl || i.modifiers.shift),
+        });
+    }
+    let Some(marquee) = &pane.marquee else {
+        return;
+    };
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        pane.selected = marquee.before.clone();
+        pane.anchor = marquee.anchor;
+        pane.marquee = None;
+        return;
+    }
+    if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+        let end = list.inner_rect.clamp(pointer) - list.inner_rect.min.to_vec2()
+            + egui::vec2(0.0, list.state.offset.y);
+        let rect = egui::Rect::from_two_pos(marquee.origin, end);
+        let start = (rect.top().max(0.0) / stride).floor() as usize;
+        let finish = ((rect.bottom().max(0.0) / stride).floor() as usize + 1).min(pane.rows.len());
+        let mut selected = if marquee.additive {
+            marquee.before.clone()
+        } else {
+            HashSet::new()
+        };
+        for index in start.min(finish)..finish {
+            if index as f32 * stride + ROW_HEIGHT >= rect.top() {
+                selected.insert(pane.rows[index].key.clone());
+            }
+        }
+        if selected != pane.selected {
+            pane.selected = selected;
+            ui.ctx().request_repaint();
+        }
+        pane.anchor = (start < pane.rows.len()).then_some(start);
+        let screen =
+            rect.translate(list.inner_rect.min.to_vec2() - egui::vec2(0.0, list.state.offset.y));
+        let painter = ui.painter().with_clip_rect(list.inner_rect);
+        painter.rect_filled(
+            screen,
+            0,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.25),
+        );
+        painter.rect_stroke(
+            screen,
+            0,
+            egui::Stroke::new(1.0, ui.visuals().selection.stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        if ui.input(|i| i.pointer.primary_down()) {
+            let step = if pointer.y < list.inner_rect.top() + 16.0 {
+                -12.0
+            } else if pointer.y > list.inner_rect.bottom() - 16.0 {
+                12.0
+            } else {
+                0.0
+            };
+            if step != 0.0 {
+                list.state.offset.y = (list.state.offset.y + step).clamp(
+                    0.0,
+                    (list.content_size.y - list.inner_rect.height()).max(0.0),
+                );
+                list.state.store(ui.ctx(), list.id);
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            }
+        }
+    }
+    if !ui.input(|i| i.pointer.primary_down()) {
+        pane.marquee = None;
+    }
+}
+
+fn selection_footer(ui: &mut egui::Ui, pane: &mut Pane, root: &Node, revision: (u64, u64)) {
+    let info = &mut pane.selection_info;
+    if info.selected != pane.selected || info.revision != revision {
+        let rows: Vec<_> = pane
+            .rows
+            .iter()
+            .filter(|r| pane.selected.contains(&r.key))
+            .collect();
+        let title = match rows.as_slice() {
+            [] => String::new(),
+            [row] => format!("名称：{}", row.name),
+            _ => format!("已选择 {} 项", rows.len()),
+        };
+        let paths = rows
+            .iter()
+            .flat_map(|row| match &row.target {
+                Location::Empty => vec![],
+                Location::Disk(path) => vec![path.clone()],
+                Location::Virtual(id) => root
+                    .find(*id)
+                    .filter(|n| !matches!(n.kind, Kind::Folder(_)))
+                    .map(Node::real_paths)
+                    .unwrap_or_default(),
+            })
+            .collect();
+        *info = SelectionInfo {
+            selected: pane.selected.clone(),
+            revision,
+            title,
+            paths,
+            next_read: Some(Instant::now() + Duration::from_millis(150)),
+            result: Arc::new(Mutex::new("正在读取文件信息…".into())),
+            running: info.running.clone(),
+        };
+    }
+    if info.title.is_empty() {
+        ui.allocate_space(Vec2::new(ui.available_width(), 16.0));
+        return;
+    }
+    if info.paths.is_empty() {
+        *info.result.lock().unwrap() = "虚拟项 · 大小：— · 修改日期：—".into();
+    } else if let Some(deadline) = info.next_read {
+        if Instant::now() >= deadline && !info.running.swap(true, Ordering::Relaxed) {
+            let result = info.result.clone();
+            let running = info.running.clone();
+            let paths = info.paths.clone();
+            let ctx = ui.ctx().clone();
+            info.next_read = Some(Instant::now() + Duration::from_secs(2));
+            thread::spawn(move || {
+                let text = files::selection_details(&paths);
+                *result.lock().unwrap() = text;
+                running.store(false, Ordering::Relaxed);
+                ctx.request_repaint();
+            });
+        }
+        ui.ctx().request_repaint_after(
+            info.next_read
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(100)),
+        );
+    }
+    let text = info.result.lock().unwrap().clone();
+    let text = format!("{} · {}", info.title, text);
+    ui.add(
+        egui::Label::new(
+            RichText::new(&text)
+                .size(11.0)
+                .color(ui.visuals().weak_text_color()),
+        )
+        .truncate(),
+    )
+    .on_hover_text(text);
+}
+
 fn draw_row(ui: &mut egui::Ui, row: &Row, selected: bool, expanded: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), ROW_HEIGHT),
-        Sense::click_and_drag(),
-    );
+    let (rect, allocation) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::hover());
+    let name_width = ui
+        .painter()
+        .layout_no_wrap(
+            row.name.clone(),
+            egui::FontId::proportional(14.0),
+            Color32::WHITE,
+        )
+        .size()
+        .x;
+    let mut hit = rect;
+    hit.max.x =
+        (rect.left() + row.depth as f32 * 16.0 + 44.0 + name_width + 12.0).min(rect.right());
+    let response = ui.interact(hit, allocation.id.with("item"), Sense::click_and_drag());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -2400,6 +3308,7 @@ fn selected_paths(pane: &Pane, root: &Node) -> Vec<PathBuf> {
         .iter()
         .filter(|r| pane.selected.contains(&r.key))
         .filter_map(|r| match &r.target {
+            Location::Empty => None,
             Location::Disk(p) => Some(p.clone()),
             Location::Virtual(id) => match root.find(*id) {
                 Some(Node {
@@ -2480,7 +3389,14 @@ fn real_menu(
     }
     ui.separator();
     if ui.button("移入回收站…  Delete").clicked() {
-        actions.push(Action::DeleteReal(paths));
+        actions.push(Action::DeleteReal(paths.clone(), false));
+        ui.close();
+    }
+    if ui
+        .button(RichText::new("永久删除…").color(Color32::LIGHT_RED))
+        .clicked()
+    {
+        actions.push(Action::DeleteReal(paths, true));
         ui.close();
     }
 }
@@ -2499,6 +3415,7 @@ fn forward(pane: &mut Pane) {
 }
 fn up(pane: &mut Pane, root: &Node) {
     let parent = match &pane.location {
+        Location::Empty => None,
         Location::Disk(path) => path.parent().map(|p| Location::Disk(p.to_owned())),
         Location::Virtual(id) => {
             fn parent(node: &Node, id: u64) -> Option<u64> {
@@ -2581,6 +3498,7 @@ fn keyboard(ui: &mut egui::Ui, pane: &mut Pane, root: &Node, actions: &mut Vec<A
             }
             if input.key_pressed(egui::Key::F2) {
                 actions.push(match row.target.clone() {
+                    Location::Empty => return,
                     Location::Disk(p) => Action::RenameReal(p),
                     Location::Virtual(id) => Action::RenameVirtual(id),
                 });
@@ -2608,7 +3526,7 @@ fn keyboard(ui: &mut egui::Ui, pane: &mut Pane, root: &Node, actions: &mut Vec<A
                 })
                 .collect::<Vec<_>>();
             if !paths.is_empty() {
-                actions.push(Action::DeleteReal(paths));
+                actions.push(Action::DeleteReal(paths, false));
             } else {
                 for row in &pane.rows {
                     if pane.selected.contains(&row.key)
@@ -2627,6 +3545,621 @@ mod tests {
     use super::*;
 
     #[test]
+    fn virtual_node_drops_to_workspace_root_blank_area() {
+        let ctx = egui::Context::default();
+        let mut actions = vec![];
+        let pos = egui::pos2(50.0, 70.0);
+        for released in [false, true] {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: !released,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::DragAndDrop::set_payload(ui.ctx(), VirtualDrag(3));
+                    workspace_root_drop(
+                        ui,
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(200.0)),
+                        &mut actions,
+                    );
+                },
+            );
+        }
+        assert!(matches!(actions.as_slice(), [Action::MoveVirtual(3, 0)]));
+    }
+
+    #[test]
+    fn searched_group_can_expand_and_collapse_across_frames() {
+        let ctx = egui::Context::default();
+        let root = Node {
+            id: 0,
+            name: "root".into(),
+            kind: Kind::Folder(vec![Node {
+                id: 1,
+                name: "Config".into(),
+                kind: Kind::Folder(vec![Node {
+                    id: 2,
+                    name: "child".into(),
+                    kind: Kind::File(vec![]),
+                }]),
+            }]),
+        };
+        let normal = HashSet::new();
+        let mut search = WorkspaceSearch::default();
+        let mut frame = |events| {
+            let filtered = search.filter(&root, "config", &normal).unwrap();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    library_node(
+                        ui,
+                        filtered.find(1).unwrap(),
+                        0,
+                        &mut search.expanded,
+                        &mut vec![],
+                    );
+                },
+            );
+            output
+                .shapes
+                .iter()
+                .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.job.text == "child"))
+        };
+        assert!(!frame(vec![]));
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(egui::pos2(10.0, 11.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(10.0, 11.0),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(click(true));
+        frame(click(false));
+        assert!(frame(vec![]));
+        frame(click(true));
+        frame(click(false));
+        assert!(!frame(vec![]));
+        search.filter(&root, "", &normal);
+        assert!(normal.is_empty());
+    }
+
+    #[test]
+    fn workspace_search_keeps_ancestors_and_matching_groups() {
+        let file = Node {
+            id: 2,
+            name: "Editor.LOG".into(),
+            kind: Kind::Link {
+                path: "C:/Editor.log".into(),
+                directory: false,
+            },
+        };
+        let root = Node {
+            id: 0,
+            name: "root".into(),
+            kind: Kind::Folder(vec![Node {
+                id: 1,
+                name: "Logs".into(),
+                kind: Kind::Folder(vec![file]),
+            }]),
+        };
+        let mut open = HashSet::new();
+        let filtered = filter_workspace(&root, "editor", &mut open).unwrap();
+        assert!(filtered.find(2).is_some());
+        assert!(open.contains(&1));
+        assert!(
+            filter_workspace(&root, "logs", &mut open)
+                .unwrap()
+                .find(2)
+                .is_some()
+        );
+        assert!(filter_workspace(&root, "missing", &mut open).is_none());
+        assert!(root.find(2).is_some());
+    }
+
+    #[test]
+    fn locations_tree_loads_only_expanded_directories() {
+        let ctx = egui::Context::default();
+        let mut cache = DirectoryCache::new(ctx.clone());
+        let path = PathBuf::from("C:/tree-test");
+        let child = path.join("child");
+        cache.entries.insert(
+            path.clone(),
+            Listing::Ready(vec![files::Entry {
+                path: child.clone(),
+                name: "child".into(),
+                directory: true,
+                link: false,
+                modified: None,
+            }]),
+        );
+        for open in [false, true] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    ui.make_persistent_id(("location-tree", &path)),
+                    false,
+                );
+                state.set_open(open);
+                state.store(ui.ctx());
+                location_tree(ui, &path, "root", Icon::Drive, &mut cache, &mut vec![]);
+            });
+            let child_visible = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == "child")
+            });
+            assert_eq!(child_visible, open);
+            assert!(!cache.entries.contains_key(&child));
+        }
+    }
+
+    #[test]
+    fn workspace_border_animates_within_its_bounds_in_both_themes() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), Vec2::new(230.0, 650.0));
+        for theme in [crate::theme::Theme::Light, crate::theme::Theme::Vscode] {
+            theme.apply(&ctx);
+            let mut first = None;
+            for time in [0.0, 2.0] {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        time: Some(time),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        paint_workspace_border(ui, rect);
+                    },
+                );
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh) => Some(mesh),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(mesh.vertices.len(), 3456);
+                for side in 0..4 {
+                    for layer in (0..36).step_by(4) {
+                        let end = side * 864 + 23 * 36 + layer;
+                        let next = ((side + 1) % 4) * 864 + layer;
+                        assert_eq!(mesh.vertices[end + 3].pos, mesh.vertices[next].pos);
+                        assert_eq!(mesh.vertices[end + 2].pos, mesh.vertices[next + 1].pos);
+                        assert_eq!(mesh.vertices[end + 3].color, mesh.vertices[next].color);
+                    }
+                }
+                assert!(
+                    mesh.vertices
+                        .iter()
+                        .all(|v| rect.expand(0.01).contains(v.pos))
+                );
+                let color = mesh.vertices[16].color;
+                if let Some(previous) = first {
+                    assert_ne!(previous, color);
+                }
+                first = Some(color);
+            }
+        }
+    }
+
+    #[test]
+    fn sort_modes_preserve_tree_groups_sort_search_results_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        fs::create_dir(path.join("folder")).unwrap();
+        fs::write(path.join("folder/child.txt"), "child").unwrap();
+        for (name, seconds) in [("z.rs", 100), ("a.txt", 200), ("b.rs", 300)] {
+            let file = fs::File::create(path.join(name)).unwrap();
+            file.set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        }
+        let mut cache = DirectoryCache::new(egui::Context::default());
+        cache.request(&path);
+        cache.request(&path.join("folder"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cache.poll();
+            if matches!(cache.entries.get(&path), Some(Listing::Ready(_)))
+                && matches!(
+                    cache.entries.get(&path.join("folder")),
+                    Some(Listing::Ready(_))
+                )
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut root = Workspace::default().root;
+        let mut next_id = 10;
+        root.add_paths(
+            vec![
+                (path.join("a.txt"), false),
+                (path.join("z.rs"), false),
+                (path.join("b.rs"), false),
+            ],
+            &mut next_id,
+        )
+        .unwrap();
+        let expanded = HashSet::from([format!("p:{}", path.join("folder").display())]);
+        for (sort, expected) in [
+            (SortOrder::Name, ["a.txt", "b.rs", "z.rs"]),
+            (SortOrder::Type, ["b.rs", "z.rs", "a.txt"]),
+            (SortOrder::Modified, ["b.rs", "a.txt", "z.rs"]),
+        ] {
+            let mut rows = Vec::new();
+            collect_rows(
+                &Location::Disk(path.clone()),
+                0,
+                &root,
+                &mut cache,
+                &expanded,
+                &mut rows,
+                sort,
+            );
+            assert_eq!(rows[0].name, "folder");
+            assert_eq!(rows[1].name, "child.txt");
+            assert_eq!(rows[1].depth, 1);
+            assert_eq!(
+                rows[2..]
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut results = rows[2..].to_vec();
+            results.reverse();
+            sort.sort_results(&mut results);
+            assert_eq!(
+                results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+            let mut virtual_rows = Vec::new();
+            collect_rows(
+                &Location::Virtual(0),
+                0,
+                &root,
+                &mut cache,
+                &HashSet::new(),
+                &mut virtual_rows,
+                sort,
+            );
+            assert_eq!(
+                virtual_rows
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut workspace = Workspace::default();
+            workspace.dock.iter_all_tabs_mut().next().unwrap().1.sort = sort;
+            let json = serde_json::to_value(&workspace).unwrap();
+            let restored: Workspace = serde_json::from_value(json).unwrap();
+            for (index, (_, pane)) in restored.dock.iter_all_tabs().enumerate() {
+                assert_eq!(pane.sort, if index == 0 { sort } else { SortOrder::Name });
+            }
+            let mut json = serde_json::to_value(Pane::new(1, Location::Virtual(0))).unwrap();
+            json.as_object_mut().unwrap().remove("sort");
+            assert_eq!(
+                serde_json::from_value::<Pane>(json).unwrap().sort,
+                SortOrder::Name
+            );
+        }
+    }
+
+    #[test]
+    fn blank_area_marquee_selects_rows_adds_with_ctrl_and_respects_scroll() {
+        for (additive, scrolled) in [(false, false), (true, false), (false, true)] {
+            let ctx = egui::Context::default();
+            let root = Workspace::default().root;
+            let mut cache = DirectoryCache::new(ctx.clone());
+            let path = PathBuf::from("C:/marquee");
+            cache.entries.insert(
+                path.clone(),
+                Listing::Ready(
+                    (0..100)
+                        .map(|index| files::Entry {
+                            modified: None,
+                            path: path.join(format!("row-{index}.txt")),
+                            name: format!("row-{index}.txt"),
+                            directory: false,
+                            link: false,
+                        })
+                        .collect(),
+                ),
+            );
+            let mut pane = Pane::new(1, Location::Disk(path.clone()));
+            let mut actions = Vec::new();
+            let mut active = 1;
+            let modifiers = egui::Modifiers {
+                ctrl: additive,
+                ..Default::default()
+            };
+            let mut frame = |events| {
+                let output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(900.0, 600.0),
+                        )),
+                        modifiers,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        Viewer {
+                            root: &root,
+                            cache: &mut cache,
+                            searches: &HashMap::new(),
+                            revision: 1,
+                            actions: &mut actions,
+                            active: &mut active,
+                            modal: false,
+                        }
+                        .ui(ui, &mut pane)
+                    },
+                );
+                let positions: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape
+                            && let Some(index) = text
+                                .galley
+                                .job
+                                .text
+                                .strip_prefix("row-")
+                                .and_then(|s| s.strip_suffix(".txt"))
+                            && let Ok(index) = index.parse::<usize>()
+                        {
+                            Some((index, text.pos + Vec2::new(5.0, 5.0)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                (positions, pane.selected.clone())
+            };
+            let (mut positions, _) = frame(vec![]);
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            };
+            if additive {
+                let point = positions[0].1;
+                frame(vec![egui::Event::PointerMoved(point)]);
+                frame(vec![button(point, true)]);
+                frame(vec![button(point, false)]);
+            }
+            if scrolled {
+                frame(vec![
+                    egui::Event::PointerMoved(egui::pos2(700.0, 250.0)),
+                    egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -240.0),
+                        modifiers,
+                    },
+                ]);
+                for _ in 0..30 {
+                    positions = frame(vec![]).0;
+                }
+                assert!(positions[0].0 > 0, "test did not scroll");
+            }
+            // Use rows away from clipped viewport edges, starting in the right-hand blank area.
+            let origin = egui::pos2(750.0, positions[2].1.y);
+            let end = egui::pos2(80.0, positions[4].1.y);
+            frame(vec![egui::Event::PointerMoved(origin)]);
+            frame(vec![button(origin, true)]);
+            frame(vec![egui::Event::PointerMoved(end)]);
+            let (_, selected) = frame(vec![button(end, false)]);
+            let mut expected: HashSet<_> = positions[2..=4]
+                .iter()
+                .map(|(index, _)| format!("p:{}", path.join(format!("row-{index}.txt")).display()))
+                .collect();
+            if additive {
+                expected.insert(format!("p:{}", path.join("row-0.txt").display()));
+            }
+            assert_eq!(
+                selected, expected,
+                "additive={additive}, scrolled={scrolled}"
+            );
+            assert!(egui::DragAndDrop::payload::<Vec<PathBuf>>(&ctx).is_none());
+            frame(vec![egui::Event::PointerMoved(origin)]);
+            frame(vec![button(origin, true)]);
+            frame(vec![egui::Event::PointerMoved(egui::pos2(
+                80.0,
+                positions[6].1.y,
+            ))]);
+            let (_, cancelled) = frame(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]);
+            assert_eq!(
+                cancelled, selected,
+                "Escape must restore the previous selection"
+            );
+            frame(vec![button(end, false)]);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn search_refreshes_after_operations_external_changes_and_rejects_replaced_targets() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let path = root.join("match.txt");
+        fs::write(&path, "original").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            dock: egui_dock::DockState::new(vec![Pane::new(1, Location::Disk(root.clone()))]),
+            ..Workspace::default()
+        };
+        workspace.dock.iter_all_tabs_mut().next().unwrap().1.filter = "match".into();
+        let mut app = FolderApp {
+            app_icon: ctx.load_texture(
+                "test",
+                egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0; 4]),
+                Default::default(),
+            ),
+            workspace,
+            cache: DirectoryCache::new(ctx.clone()),
+            searches: HashMap::new(),
+            global_search: crate::global_search::GlobalSearch::default(),
+            actions: vec![Action::Search(
+                1,
+                Location::Disk(root.clone()),
+                "match".into(),
+            )],
+            tx,
+            rx,
+            status: String::new(),
+            error: false,
+            active: 1,
+            sidebar_open: HashSet::new(),
+            sidebar_filter: String::new(),
+            sidebar_search: WorkspaceSearch::default(),
+            revision: 0,
+            chooser: None,
+            edit: None,
+            delete: None,
+            cut_guards: Vec::new(),
+            busy: false,
+            config: root.join("workspace.json"),
+            writable: false,
+            _lock: None,
+            saved: Vec::new(),
+            save_error: None,
+            last_save: Instant::now(),
+            help: false,
+            native_window: 0,
+            release_native_drag: false,
+        };
+        fn wait(app: &mut FolderApp, ctx: &egui::Context, matches: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.poll();
+                app.act(ctx);
+                let pane = app.workspace.dock.iter_all_tabs().next().unwrap().1;
+                if !app.busy
+                    && app.actions.is_empty()
+                    && app.searches.get(&1).is_some_and(|s| s.done)
+                    && pane.rows.len() == matches
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "search did not converge: {}",
+                    app.status
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        wait(&mut app, &ctx, 1);
+        assert!(app.searches[&1].watch_error.is_none());
+        // Capture the confirmation snapshot, then replace the file at the same path.
+        app.actions
+            .push(Action::DeleteReal(vec![path.clone()], true));
+        app.act(&ctx);
+        let (_, _, guards) = app.delete.take().unwrap();
+        fs::rename(&path, root.join("old.txt")).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        for operation in [
+            Operation::PermanentDelete(vec![path.clone()]),
+            Operation::Trash(vec![path.clone()]),
+            Operation::Rename {
+                source: path.clone(),
+                name: "renamed.txt".into(),
+            },
+            Operation::Copy {
+                sources: vec![path.clone()],
+                destination: root.clone(),
+                moving: true,
+            },
+        ] {
+            assert!(
+                files::operate(
+                    Operation::Checked(guards.clone(), Box::new(operation)),
+                    |_| {}
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        }
+        // F5/top refresh share this action; replace the whole scan and drop old batches.
+        let pane = app.workspace.dock.iter_all_tabs_mut().next().unwrap().1;
+        pane.selected.insert(pane.rows[0].key.clone());
+        pane.anchor = Some(0);
+        app.actions.push(Action::Refresh);
+        app.act(&ctx);
+        let pane = app.workspace.dock.iter_all_tabs().next().unwrap().1;
+        assert!(pane.rows.is_empty() && pane.selected.is_empty() && pane.anchor.is_none());
+        // Drain queued restart before waiting, even though the old scan is done.
+        app.act(&ctx);
+        wait(&mut app, &ctx, 1);
+        assert!(
+            files::validate_targets(&app.target_guards(std::slice::from_ref(&path)).unwrap())
+                .is_ok()
+        );
+        // Actual application deletion must refresh without waiting for the watcher.
+        app.operation(&ctx, Operation::PermanentDelete(vec![path.clone()]));
+        wait(&mut app, &ctx, 0);
+        assert!(!path.exists());
+        // External additions, renames, and deletions must all converge automatically.
+        fs::write(&path, "external").unwrap();
+        wait(&mut app, &ctx, 1);
+        fs::rename(&path, root.join("elsewhere.txt")).unwrap();
+        wait(&mut app, &ctx, 0);
+        fs::write(&path, "external again").unwrap();
+        wait(&mut app, &ctx, 1);
+        fs::remove_file(&path).unwrap();
+        wait(&mut app, &ctx, 0);
+        // A failed/partially completed operation also invalidates old results.
+        app.tx
+            .send(Event::Finished(Err("partial failure".into())))
+            .unwrap();
+        app.poll();
+        assert!(
+            app.actions
+                .iter()
+                .any(|a| matches!(a, Action::Search(1, _, _)))
+        );
+        app.act(&ctx);
+        wait(&mut app, &ctx, 0);
+        app.actions.push(Action::StopSearch(1));
+        app.act(&ctx);
+        assert!(app.searches[&1].cancelled());
+        app.actions.push(Action::Refresh);
+        app.act(&ctx);
+        app.act(&ctx);
+        assert!(!app.searches[&1].cancelled());
+    }
+
+    #[test]
     fn copied_paths_are_normalized_deduplicated_and_line_separated() {
         assert_eq!(
             paths_text(&[
@@ -2637,6 +4170,171 @@ mod tests {
             "C:/项目/日志.txt\r\n//server/共享/配置.json"
         );
         assert!(paths_text(&[]).is_empty());
+    }
+
+    #[test]
+    fn blank_area_menu_opens_current_directory_and_resolves_virtual_paths() {
+        let ctx = egui::Context::default();
+        let root = Node {
+            id: 0,
+            name: "root".into(),
+            kind: Kind::Folder(vec![
+                Node {
+                    id: 1,
+                    name: "dir".into(),
+                    kind: Kind::Link {
+                        path: "C:/project".into(),
+                        directory: true,
+                    },
+                },
+                Node {
+                    id: 2,
+                    name: "file".into(),
+                    kind: Kind::File(vec![
+                        "C:/project/file.txt".into(),
+                        "D:/other/file.txt".into(),
+                    ]),
+                },
+            ]),
+        };
+        assert_eq!(
+            explorer_directories(&Location::Virtual(0), &root),
+            vec![PathBuf::from("C:/project"), PathBuf::from("D:/other")]
+        );
+        assert!(explorer_directories(&Location::Virtual(999), &root).is_empty());
+        let mut cache = DirectoryCache::new(ctx.clone());
+        let path = PathBuf::from("C:/project");
+        cache.entries.insert(path.clone(), Listing::Ready(vec![]));
+        let mut pane = Pane::new(3, Location::Disk(path.clone()));
+        let mut active = 3;
+        let mut actions = vec![];
+        let mut frame = |events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    Viewer {
+                        root: &root,
+                        cache: &mut cache,
+                        searches: &HashMap::new(),
+                        revision: 1,
+                        actions: &mut actions,
+                        active: &mut active,
+                        modal: false,
+                    }
+                    .ui(ui, &mut pane);
+                },
+            )
+        };
+        let pos = egui::pos2(250.0, 250.0);
+        let click = |pos, button, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(vec![]);
+        frame(click(pos, egui::PointerButton::Secondary, true));
+        frame(click(pos, egui::PointerButton::Secondary, false));
+        let output = frame(vec![]);
+        let item = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text == "在 Windows 文件管理器中打开" =>
+                {
+                    Some(text.pos + Vec2::splat(5.0))
+                }
+                _ => None,
+            })
+            .expect("blank-area menu missing");
+        frame(click(item, egui::PointerButton::Primary, true));
+        frame(click(item, egui::PointerButton::Primary, false));
+        assert!(matches!(actions.as_slice(), [Action::Open(p)] if p == &path));
+    }
+
+    #[test]
+    fn search_icon_toggles_field_focus_and_preserves_query() {
+        let ctx = egui::Context::default();
+        let root = Workspace::default().root;
+        let mut cache = DirectoryCache::new(ctx.clone());
+        let mut pane = Pane::new(1, Location::Virtual(0));
+        let mut active = 1;
+        let mut frame = |pane: &mut Pane, events| {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    Viewer {
+                        root: &root,
+                        cache: &mut cache,
+                        searches: &HashMap::new(),
+                        revision: 1,
+                        actions: &mut vec![],
+                        active: &mut active,
+                        modal: false,
+                    }
+                    .ui(ui, pane);
+                },
+            );
+            let center = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Circle(circle) if circle.radius == 4.5 => {
+                        Some(circle.center + Vec2::splat(2.0))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let has_hint = output.shapes.iter().any(|shape| {
+                matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text.contains("搜索名称"))
+            });
+            (center, has_hint)
+        };
+        let (button, visible) = frame(&mut pane, vec![]);
+        assert!(!visible && !pane.search_visible);
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(button),
+                egui::Event::PointerButton {
+                    pos: button,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        frame(&mut pane, click(true));
+        let (_, visible) = frame(&mut pane, click(false));
+        assert!(visible && pane.search_visible);
+        assert!(ctx.memory(|m| m.focused().is_some()));
+        frame(&mut pane, vec![egui::Event::Text("config".into())]);
+        assert_eq!(pane.filter, "config");
+        frame(&mut pane, click(true));
+        frame(&mut pane, click(false));
+        assert!(!pane.search_visible);
+        assert_eq!(pane.filter, "config");
+        assert!(!Pane::new(2, Location::Virtual(0)).search_visible);
     }
 
     #[test]
@@ -2674,39 +4372,78 @@ mod tests {
     }
 
     #[test]
-    fn external_drop_is_consumed_once_by_virtual_target() {
-        let ctx = egui::Context::default();
-        let mut actions = Vec::new();
-        let mut target = egui::Pos2::ZERO;
-        for dropped in [false, true] {
-            let _ = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        Vec2::new(400.0, 200.0),
-                    )),
-                    events: vec![egui::Event::PointerMoved(target)],
-                    dropped_files: if dropped {
-                        vec![egui::DroppedFile {
-                            path: Some(PathBuf::from("C:/source.rs")),
-                            ..Default::default()
-                        }]
-                    } else {
-                        vec![]
+    fn empty_pane_binds_real_paths_without_transfers() {
+        let mut pane = Pane::new(99, Location::Empty);
+        bind_real_path(&mut pane, PathBuf::from("C:/project"), true);
+        assert_eq!(pane.location, Location::Disk("C:/project".into()));
+        assert!(pane.pending_selection.is_none());
+        bind_real_path(&mut pane, PathBuf::from("C:/project/file.txt"), false);
+        assert_eq!(pane.location, Location::Disk("C:/project".into()));
+        assert_eq!(pane.pending_selection, Some("p:C:/project/file.txt".into()));
+    }
+
+    #[test]
+    fn external_drop_is_consumed_once_by_virtual_disk_and_empty_targets() {
+        for mode in 0..3 {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut target = egui::Pos2::ZERO;
+            for dropped in [false, true] {
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(400.0, 200.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(target)],
+                        dropped_files: if dropped {
+                            vec![
+                                egui::DroppedFile {
+                                    path: Some(PathBuf::from("C:/source.rs")),
+                                    ..Default::default()
+                                },
+                                egui::DroppedFile {
+                                    path: Some(PathBuf::from("C:/source-folder")),
+                                    ..Default::default()
+                                },
+                            ]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-                |ui| {
-                    let response = ui.button("virtual target");
-                    target = response.rect.center();
-                    accept_drop(&response, 9, &mut actions);
-                    accept_drop(&response, 0, &mut actions);
-                },
-            );
+                    |ui| {
+                        let response = ui.button("virtual target");
+                        target = response.rect.center();
+                        if mode == 2 {
+                            accept_empty_drop(&response, 9, &mut actions);
+                        } else if mode == 1 {
+                            accept_disk_drop(&response, Path::new("C:/target"), &mut actions);
+                        } else {
+                            accept_drop(&response, 9, &mut actions);
+                        }
+                        accept_drop(&response, 0, &mut actions);
+                    },
+                );
+            }
+            let expected = vec![
+                PathBuf::from("C:/source.rs"),
+                PathBuf::from("C:/source-folder"),
+            ];
+            if mode == 2 {
+                assert!(
+                    matches!(actions.as_slice(), [Action::BindPane(9, paths)] if paths == &expected)
+                );
+            } else if mode == 1 {
+                assert!(
+                    matches!(actions.as_slice(), [Action::Transfer(paths, destination, false)] if paths == &expected && destination == Path::new("C:/target"))
+                );
+            } else {
+                assert!(
+                    matches!(actions.as_slice(), [Action::Import(9, paths)] if paths == &expected)
+                );
+            }
         }
-        assert!(
-            matches!(actions.as_slice(), [Action::Import(9, paths)] if paths == &vec![PathBuf::from("C:/source.rs")])
-        );
     }
 
     #[test]
@@ -2727,6 +4464,7 @@ mod tests {
             cache.entries.insert(
                 PathBuf::from("C:/"),
                 Listing::Ready(vec![files::Entry {
+                    modified: None,
                     path: "C:/source.rs".into(),
                     name: "source.rs".into(),
                     directory: false,
@@ -2736,6 +4474,7 @@ mod tests {
             cache.entries.insert(
                 PathBuf::from("C:/target"),
                 Listing::Ready(vec![files::Entry {
+                    modified: None,
                     path: "C:/target/drop-target".into(),
                     name: "drop-target".into(),
                     directory: folder_target,
@@ -2867,6 +4606,7 @@ mod tests {
             Listing::Ready(
                 (0..100_000)
                     .map(|i| files::Entry {
+                        modified: None,
                         path: path.join(format!("file-{i}.rs")),
                         name: format!("file-{i}.rs"),
                         directory: false,

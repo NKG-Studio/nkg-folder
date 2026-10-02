@@ -8,7 +8,7 @@ pub struct FileClipboard {
 }
 
 #[cfg(windows)]
-fn drop_files(paths: &[PathBuf]) -> Result<Vec<u8>, String> {
+pub(crate) fn drop_files(paths: &[PathBuf]) -> Result<Vec<u8>, String> {
     use std::os::windows::ffi::OsStrExt;
     if paths.is_empty() {
         return Err("请先选中真实文件或目录。".into());
