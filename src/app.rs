@@ -535,7 +535,7 @@ impl FolderApp {
         global_search.warm(
             error
                 .is_none()
-                .then(|| config.with_file_name("file-index.bin")),
+                .then(|| config.with_file_name("file-index.sqlite")),
             &cc.egui_ctx,
         );
         Self {
@@ -1471,7 +1471,7 @@ impl eframe::App for FolderApp {
                 if tool_button(ui, Icon::Search, "全电脑搜索", [30.0, 26.0]).clicked() {
                     let cache = self
                         .writable
-                        .then(|| self.config.with_file_name("file-index.bin"));
+                        .then(|| self.config.with_file_name("file-index.sqlite"));
                     self.global_search.open(cache, &ctx);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

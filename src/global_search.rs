@@ -4,11 +4,11 @@ use notify::EventKind;
 #[cfg(not(windows))]
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::{
-    collections::HashMap,
     ffi::OsString,
     fs,
-    io::{BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -20,13 +20,13 @@ use std::{
 };
 
 const LIMIT: usize = 500;
-mod index;
+mod database;
 #[cfg(windows)]
 mod ntfs;
 mod scanner;
 #[cfg(windows)]
 mod watch;
-use index::{Builder, Searcher, Snapshot};
+use database::{Reader, Writer};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 struct Checkpoint {
@@ -36,102 +36,26 @@ struct Checkpoint {
     next: i64,
 }
 
-struct Parent {
-    path: PathBuf,
-    folded: String,
-}
-
 #[derive(Clone)]
 struct Item {
-    parent: Arc<Parent>,
-    name: OsString,
+    path: PathBuf,
     directory: bool,
-    folded: String,
-    full_folded: String,
 }
 
 impl Item {
-    fn new(path: PathBuf, directory: bool, parents: &mut HashMap<PathBuf, Arc<Parent>>) -> Self {
-        let directory_path = path.parent().unwrap_or(&path);
-        let parent = parents
-            .entry(directory_path.to_owned())
-            .or_insert_with(|| {
-                Arc::new(Parent {
-                    path: directory_path.to_owned(),
-                    folded: format!(
-                        "{}/",
-                        directory_path
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                            .trim_end_matches('/')
-                            .to_lowercase()
-                    ),
-                })
-            })
-            .clone();
-        let name = path.file_name().unwrap_or_default().to_owned();
-        let folded = name.to_string_lossy().to_lowercase();
-        let full_folded = format!("{}{folded}", parent.folded);
-        Self {
-            parent,
-            name,
-            directory,
-            folded,
-            full_folded,
-        }
+    fn new(path: PathBuf, directory: bool) -> Self {
+        Self { path, directory }
     }
-
-    fn path(&self) -> PathBuf {
-        self.parent.path.join(&self.name)
-    }
-
     #[cfg(test)]
-    fn contains(&self, word: &str) -> bool {
-        self.folded.contains(word)
-            || self.parent.folded.contains(word)
-            || word.match_indices('/').any(|(i, _)| {
-                self.parent.folded.ends_with(&word[..=i]) && self.folded.starts_with(&word[i + 1..])
-            })
+    fn path(&self) -> PathBuf {
+        self.path.clone()
     }
-}
-
-impl Serialize for Item {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        (self.path(), self.directory).serialize(serializer)
-    }
-}
-
-// Decode one record at a time and share parents immediately, avoiding a second full path list.
-fn load_cache(reader: impl std::io::Read) -> Result<Vec<Item>, serde_json::Error> {
-    struct Items;
-    impl<'de> serde::de::Visitor<'de> for Items {
-        type Value = Vec<Item>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("file index records")
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut items = Vec::new();
-            let mut parents = HashMap::new();
-            while let Some((path, directory)) = seq.next_element::<(PathBuf, bool)>()? {
-                items.push(Item::new(path, directory, &mut parents));
-            }
-            Ok(items)
-        }
-    }
-    use serde::Deserializer;
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    let items = deserializer.deserialize_seq(Items)?;
-    deserializer.end()?;
-    Ok(items)
 }
 
 #[derive(Default)]
 struct Index {
-    items: Arc<Snapshot>,
-    remote_count: Option<usize>,
+    count: usize,
+    database: Option<Arc<database::Location>>,
     failed: bool,
     revision: u64,
     scanning: bool,
@@ -165,7 +89,7 @@ impl Hit {
     }
 }
 
-#[derive(Default, Serialize, serde::Deserialize)]
+#[derive(Default, Clone, Serialize, serde::Deserialize)]
 struct Results {
     ticket: u64,
     revision: u64,
@@ -193,6 +117,7 @@ impl Drop for Engine {
 
 impl Engine {
     fn start(roots: Vec<PathBuf>, cache: Option<PathBuf>, ctx: egui::Context) -> Self {
+        let roots = scanner::minimal_roots(&roots);
         if let Some(client) = crate::backend::client() {
             return Self::remote(roots, cache, ctx, client.clone());
         }
@@ -215,31 +140,59 @@ impl Engine {
         };
         let data = engine.index.clone();
         let stop = engine.stop.clone();
+        let rebuild = engine.rebuild.clone();
         let current = engine.ticket.clone();
-        let repaint = ctx.clone();
         thread::spawn(move || {
-            let mut searcher = Searcher::new();
-            while !stop.load(Ordering::Relaxed) {
-                let Ok(mut query) = queries.recv_timeout(Duration::from_millis(200)) else {
-                    continue;
-                };
-                while let Ok(newer) = queries.try_recv() {
-                    query = newer;
+            let run = || -> Result<(), String> {
+                let mut writer = Writer::open(cache, stop.clone())?;
+                let state = writer.state()?;
+                {
+                    let mut index = data.write().unwrap();
+                    index.count = state.count;
+                    index.revision = state.revision;
+                    index.database = Some(writer.location.clone());
                 }
-                let (snapshot, revision) = {
-                    let index = data.read().unwrap();
-                    (index.items.clone(), index.revision)
-                };
-                searcher.find(snapshot, revision, &query.1, query.0, &current, |result| {
-                    let _ = results.send(result);
-                    repaint.request_repaint();
+                let mut reader = Reader::open(writer.location.clone())?;
+                let (query_stop, query_data, repaint) = (stop.clone(), data.clone(), ctx.clone());
+                thread::spawn(move || {
+                    while !query_stop.load(Ordering::Relaxed) {
+                        let Ok(mut query) = queries.recv_timeout(Duration::from_millis(200)) else {
+                            continue;
+                        };
+                        while let Ok(newer) = queries.try_recv() {
+                            query = newer;
+                        }
+                        if current.load(Ordering::Relaxed) != query.0 {
+                            continue;
+                        }
+                        if let Err(error) = reader.find(
+                            &query.1,
+                            query.0,
+                            current.clone(),
+                            query_stop.clone(),
+                            |result| {
+                                let _ = results.send(result);
+                                repaint.request_repaint();
+                            },
+                        ) {
+                            fail_index(&query_data, &query_stop, &repaint, error);
+                            break;
+                        }
+                    }
                 });
+                maintain(
+                    data.clone(),
+                    roots,
+                    &mut writer,
+                    stop.clone(),
+                    rebuild,
+                    ctx.clone(),
+                )
+            };
+            if let Err(error) = run() {
+                fail_index(&data, &stop, &ctx, error);
             }
         });
-        let data = engine.index.clone();
-        let stop = engine.stop.clone();
-        let rebuild = engine.rebuild.clone();
-        thread::spawn(move || maintain(data, roots, cache, stop, rebuild, ctx));
         engine
     }
 }
@@ -251,6 +204,7 @@ enum RemoteEvent {
         revision: u64,
         scanning: bool,
         skipped: usize,
+        failed: bool,
         warning: String,
     },
     Result(Results),
@@ -291,10 +245,11 @@ pub(crate) fn serve_remote(
             let index = engine.index.read().unwrap();
             if !sink.emit(
                 &RemoteEvent::Status {
-                    count: index.items.len(),
+                    count: index.count,
                     revision: index.revision,
                     scanning: index.scanning,
                     skipped: index.skipped,
+                    failed: index.failed,
                     warning: index.warning.clone(),
                 },
                 false,
@@ -309,7 +264,13 @@ pub(crate) fn serve_remote(
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let index = engine.index.read().unwrap();
+                if index.failed {
+                    sink.error(index.warning.clone());
+                }
+                break;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
@@ -385,10 +346,12 @@ impl Engine {
                             revision,
                             scanning,
                             skipped,
+                            failed,
                             warning,
                         } => {
                             let mut index = index.write().unwrap();
-                            index.remote_count = Some(count);
+                            index.count = count;
+                            index.failed = failed;
                             index.revision = revision;
                             index.scanning = scanning;
                             index.skipped = skipped;
@@ -422,71 +385,9 @@ impl Engine {
 }
 
 #[cfg(test)]
-fn find(items: &[Item], query: &str, ticket: u64, current: &AtomicU64) -> Option<Results> {
-    let workers = thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4);
-    if items.len() < 250_000 || workers == 1 || query.trim().is_empty() {
-        return find_serial(items, query, ticket, current);
-    }
-    let start = Instant::now();
-    thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .chunks(items.len().div_ceil(workers))
-            .map(|chunk| scope.spawn(move || find_serial(chunk, query, ticket, current)))
-            .collect();
-        let mut result = Results {
-            ticket,
-            ..Results::default()
-        };
-        // Join in index order, preserving the same first 500 hits as a serial search.
-        for handle in handles {
-            let partial = handle.join().expect("search worker panicked")?;
-            result.total += partial.total;
-            result
-                .hits
-                .extend(partial.hits.into_iter().take(LIMIT - result.hits.len()));
-        }
-        if current.load(Ordering::Relaxed) != ticket {
-            return None;
-        }
-        result.elapsed = start.elapsed();
-        Some(result)
-    })
-}
-
-#[cfg(test)]
-fn find_serial(items: &[Item], query: &str, ticket: u64, current: &AtomicU64) -> Option<Results> {
-    let start = Instant::now();
-    let normalized = query.replace('\\', "/").to_lowercase();
-    let words: Vec<_> = normalized.split_whitespace().collect();
-    let mut result = Results {
-        ticket,
-        ..Results::default()
-    };
-    if !words.is_empty() {
-        for (i, item) in items.iter().enumerate() {
-            if i % 1024 == 0 && current.load(Ordering::Relaxed) != ticket {
-                return None;
-            }
-            if words.iter().all(|word| item.contains(word)) {
-                result.total += 1;
-                // ponytail: retain 500 hits; add paging if browsing broad queries becomes necessary.
-                if result.hits.len() < LIMIT {
-                    result.hits.push(Hit::new(item.path(), item.directory));
-                }
-            }
-        }
-    }
-    result.elapsed = start.elapsed();
-    Some(result)
-}
-
-#[cfg(test)]
 fn scan(roots: &[PathBuf], stop: &AtomicBool, mut batch: impl FnMut(Vec<Item>)) -> (usize, String) {
     let mut pending: Vec<_> = roots.iter().cloned().map(|path| (path, None)).collect();
     let mut items = Vec::new();
-    let mut parents = HashMap::new();
     let mut skipped = 0;
     let mut warning = String::new();
     while let Some((path, cached)) = pending.pop() {
@@ -515,7 +416,7 @@ fn scan(roots: &[PathBuf], stop: &AtomicBool, mut batch: impl FnMut(Vec<Item>)) 
             use std::os::windows::fs::MetadataExt;
             link |= metadata.file_attributes() & 0x400 != 0;
         }
-        items.push(Item::new(path.clone(), directory, &mut parents));
+        items.push(Item::new(path.clone(), directory));
         if directory && !link {
             match fs::read_dir(&path) {
                 Ok(entries) => {
@@ -561,43 +462,30 @@ fn scan_parallel(
     scanner::run(roots, stop, batch)
 }
 
-fn save_cache(path: &Path, items: &Snapshot) -> Result<(), String> {
-    crate::backend::user_io(|| save_cache_as_user(path, items))
+fn fail_index(data: &RwLock<Index>, stop: &AtomicBool, ctx: &egui::Context, error: String) {
+    let mut index = data.write().unwrap();
+    index.failed = true;
+    index.scanning = false;
+    index.warning = format!("搜索数据库不可用：{error}");
+    stop.store(true, Ordering::Relaxed);
+    ctx.request_repaint();
 }
 
-fn save_cache_as_user(path: &Path, items: &Snapshot) -> Result<(), String> {
-    let mut file = tempfile::Builder::new()
-        .prefix(".nkg-index-")
-        .tempfile_in(path.parent().ok_or("索引路径无父目录")?)
-        .map_err(|e| e.to_string())?;
-    {
-        let mut writer = BufWriter::new(file.as_file_mut());
-        items.write_cache(&mut writer).map_err(|e| e.to_string())?;
-        writer.flush().map_err(|e| e.to_string())?;
-    }
-    file.persist(path).map_err(|e| e.to_string())?;
-    Ok(())
+fn publish(data: &RwLock<Index>, ctx: &egui::Context, state: database::State) {
+    let mut index = data.write().unwrap();
+    index.count = state.count;
+    index.revision = state.revision;
+    ctx.request_repaint();
 }
 
 fn maintain(
     data: Arc<RwLock<Index>>,
     roots: Vec<PathBuf>,
-    cache: Option<PathBuf>,
+    writer: &mut Writer,
     stop: Arc<AtomicBool>,
     rebuild: Arc<AtomicBool>,
     ctx: egui::Context,
-) {
-    let mut builder = Builder::default();
-    let publish = |builder: &mut Builder| {
-        let snapshot = builder.publish();
-        let old = {
-            let mut index = data.write().unwrap();
-            index.revision += 1;
-            std::mem::replace(&mut index.items, snapshot)
-        };
-        drop(old);
-        ctx.request_repaint();
-    };
+) -> Result<(), String> {
     // Bounded notifications: overflow triggers a full reconciliation instead of losing changes.
     let (events, receiver) = mpsc::sync_channel(65_536);
     #[cfg(windows)]
@@ -638,245 +526,162 @@ fn maintain(
         }
         (watcher, watch_warning)
     };
-    if let Some(path) = &cache {
-        let _ =
-            crate::backend::user_io(|| {
-                let loaded = fs::File::open(path).ok().and_then(|file| {
-                    let size = file.metadata().ok()?.len();
-                    Snapshot::read_cache(BufReader::new(file), size).ok()
-                });
-                if let Some(snapshot) = loaded {
-                    if snapshot
-                        .iter()
-                        .all(|item| roots.iter().any(|root| item.parent.path.starts_with(root)))
-                    {
-                        builder = Builder::from_snapshot(snapshot);
-                    } else {
-                        builder.extend(
-                            snapshot
-                                .iter()
-                                .filter(|item| {
-                                    roots.iter().any(|root| item.parent.path.starts_with(root))
-                                })
-                                .cloned(),
-                        );
-                    }
-                } else if let Ok(file) = fs::File::open(path.with_file_name("file-index.json"))
-                    && let Ok(items) = load_cache(BufReader::new(file))
-                {
-                    builder.extend(items.into_iter().filter(|item| {
-                        roots.iter().any(|root| item.parent.path.starts_with(root))
-                    }));
-                }
-                publish(&mut builder);
-                Ok(())
-            });
-    }
-    let mut full = true;
+    let initial = writer.state()?;
+    let mut checkpoints: Vec<Checkpoint> =
+        serde_json::from_str(&initial.checkpoints).map_err(|e| e.to_string())?;
+    let mut full = initial.dirty || initial.roots != database::roots_key(&roots);
     let mut startup = true;
-    let mut dirty = false;
-    let mut last_save = Instant::now() - Duration::from_secs(30);
-    let mut saving: Option<mpsc::Receiver<Result<(), String>>> = None;
+    let mut last_check = Instant::now();
+    data.write().unwrap().warning.clone_from(&watch_warning);
     while !stop.load(Ordering::Relaxed) {
         let requested = rebuild.swap(false, Ordering::Relaxed);
-        if full || requested {
-            let partial = data.read().unwrap().items.is_empty();
-            data.write().unwrap().scanning = true;
-            ctx.request_repaint();
-            let mut scan_roots = Vec::new();
-            let mut checkpoints = Vec::new();
+        let mut changed = Vec::new();
+        let mut next_checkpoints = checkpoints.clone();
+        let mut replayed = false;
+        if startup || full || requested || last_check.elapsed() >= Duration::from_secs(30) {
+            next_checkpoints.clear();
             for root in &roots {
                 #[cfg(windows)]
-                if startup
-                    && !partial
+                if !full
                     && !requested
-                    && let Some(old) = builder.checkpoints().iter().find(|c| &c.root == root)
+                    && let Some(old) = checkpoints.iter().find(|c| &c.root == root)
                     && let Some((paths, checkpoint)) = ntfs::changes(old, &stop)
                 {
-                    scan_roots.extend(paths);
-                    checkpoints.push(checkpoint);
+                    changed.extend(paths);
+                    next_checkpoints.push(checkpoint);
                     continue;
                 }
-                scan_roots.push(root.clone());
+                if startup || full || requested || checkpoints.iter().any(|c| &c.root == root) {
+                    changed.push(root.clone());
+                }
                 #[cfg(windows)]
                 if let Some(checkpoint) = ntfs::checkpoint(root) {
-                    checkpoints.push(checkpoint);
+                    next_checkpoints.push(checkpoint);
                 }
             }
-            let reuse = startup
-                && !partial
-                && !requested
-                && roots.iter().any(|root| !scan_roots.contains(root));
-            let mut next = if reuse {
-                std::mem::take(&mut builder)
-            } else {
-                Builder::default()
-            };
-            startup = false;
-            next.remove_subtrees(&scan_roots);
-            next.set_checkpoints(checkpoints);
-            let mut last_publish = Instant::now();
-            let (skipped, warning) = scan_parallel(&scan_roots, &stop, |mut batch| {
-                batch.retain(|item| !cached_item(item, cache.as_deref()));
-                next.extend(batch);
-                if partial && last_publish.elapsed() >= Duration::from_millis(100) {
-                    publish(&mut next);
-                    last_publish = Instant::now();
-                }
-            });
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            builder = next;
-            publish(&mut builder);
-            let mut index = data.write().unwrap();
-            index.skipped = skipped;
-            index.warning = [watch_warning.as_str(), warning.as_str()]
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("；");
-            index.scanning = false;
-            index.revision += 1;
-            full = false;
-            dirty = true;
-            ctx.request_repaint();
+            last_check = Instant::now();
+            replayed = true;
         }
-        let mut changed = Vec::new();
-        let until = Instant::now() + Duration::from_millis(40);
-        while Instant::now() < until && !stop.load(Ordering::Relaxed) {
-            match receiver.recv_timeout(Duration::from_millis(40)) {
-                Ok(Ok(event)) => {
-                    if event.need_rescan() {
-                        full = true;
-                    }
-                    changed.extend(event.paths.into_iter().filter(|p| {
-                        roots.iter().any(|root| p.starts_with(root))
-                            && !cache_file(p, cache.as_deref())
-                    }));
-                }
-                Ok(Err(error)) => {
-                    watch_warning = format!("目录通知失败，已安排核对；后续请手动重建：{error}");
-                    data.write().unwrap().warning.clone_from(&watch_warning);
-                    full = true;
-                    ctx.request_repaint();
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    thread::sleep(Duration::from_millis(40));
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-            }
-        }
-        if full {
-            continue;
-        }
-        #[cfg(windows)]
-        let next_checkpoints =
-            if dirty && saving.is_none() && last_save.elapsed() > Duration::from_secs(30) {
-                let mut checkpoints = Vec::new();
-                for old in builder.checkpoints() {
-                    if let Some((paths, checkpoint)) = ntfs::changes(old, &stop) {
-                        changed.extend(paths);
-                        checkpoints.push(checkpoint);
-                    } else {
-                        changed.push(old.root.clone());
-                        if let Some(checkpoint) = ntfs::checkpoint(&old.root) {
-                            checkpoints.push(checkpoint);
+        if !startup && !full && !requested {
+            let until = Instant::now() + Duration::from_millis(40);
+            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                match receiver.recv_timeout(Duration::from_millis(40)) {
+                    Ok(Ok(event)) => {
+                        if event.need_rescan() {
+                            full = true;
+                        }
+                        let renamed = matches!(
+                            event.kind,
+                            EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        );
+                        for path in event.paths {
+                            if !roots.iter().any(|root| path.starts_with(root))
+                                || cache_file(&path, Some(&writer.location.path))
+                            {
+                                continue;
+                            }
+                            // A case-only rename leaves the old spelling accessible on Windows.
+                            // Enumerate its parent to recover the real names (also covers rapid reuse).
+                            if renamed
+                                && path.try_exists().unwrap_or(true)
+                                && let Some(parent) = path.parent()
+                                && roots.iter().any(|root| parent.starts_with(root))
+                            {
+                                changed.push(parent.to_owned());
+                            } else {
+                                changed.push(path);
+                            }
+                        }
+                        if changed.len() > 65_536 {
+                            full = true;
+                            break;
                         }
                     }
-                }
-                Some(checkpoints)
-            } else {
-                None
-            };
-        changed.sort();
-        changed.dedup();
-        // A changed parent covers descendants, including directory rename/delete.
-        let mut minimal: Vec<PathBuf> = Vec::new();
-        for path in changed {
-            if !minimal
-                .last()
-                .is_some_and(|parent| path.starts_with(parent))
-            {
-                minimal.push(path);
-            }
-        }
-        if !minimal.is_empty() {
-            let mut additions = Vec::new();
-            let (skipped, warning) =
-                scan_parallel(&minimal, &stop, |batch| additions.extend(batch));
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            additions.retain(|item| !cached_item(item, cache.as_deref()));
-            builder.remove_subtrees(&minimal);
-            builder.extend(additions);
-            publish(&mut builder);
-            let mut index = data.write().unwrap();
-            index.skipped += skipped;
-            if !warning.is_empty() {
-                index.warning = [watch_warning.as_str(), warning.as_str()]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("；");
-            }
-            index.revision += 1;
-            dirty = true;
-            ctx.request_repaint();
-        }
-        #[cfg(windows)]
-        if let Some(checkpoints) = next_checkpoints {
-            builder.set_checkpoints(checkpoints);
-            publish(&mut builder);
-        }
-        if let Some(receiver) = &saving {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    if let Err(error) = result {
-                        data.write().unwrap().warning = format!("索引缓存未保存：{error}");
-                        dirty = true;
-                        ctx.request_repaint();
+                    Ok(Err(error)) => {
+                        watch_warning =
+                            format!("目录通知失败，已安排核对；后续请手动重建：{error}");
+                        data.write().unwrap().warning.clone_from(&watch_warning);
+                        full = true;
                     }
-                    saving = None;
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        thread::sleep(Duration::from_millis(40))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    saving = None;
-                    dirty = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if full {
+                continue;
             }
         }
-        if dirty && saving.is_none() && last_save.elapsed() > Duration::from_secs(30) {
-            if let Some(path) = &cache {
-                let path = path.clone();
-                let snapshot = data.read().unwrap().items.clone();
-                let (tx, rx) = mpsc::channel();
-                thread::spawn(move || {
-                    let _ = tx.send(save_cache(&path, &snapshot));
-                });
-                saving = Some(rx);
-            }
-            dirty = false;
-            last_save = Instant::now();
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
+        let changed = scanner::minimal_roots(&changed);
+        if !changed.is_empty() || full || requested {
+            data.write().unwrap().scanning = true;
+            ctx.request_repaint();
+            let generation = writer.begin_scan()?;
+            let cache = writer.location.path.clone();
+            let mut failure = None;
+            let (skipped, warning) = scan_parallel(&changed, &stop, |mut batch| {
+                batch.retain(|item| !cache_file(&item.path, Some(&cache)));
+                if failure.is_some() {
+                    return;
+                }
+                match writer.insert(batch, generation) {
+                    Ok(state) => publish(&data, &ctx, state),
+                    Err(error) => {
+                        failure = Some(error);
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            writer.prune(&changed, generation, full || requested, |state| {
+                publish(&data, &ctx, state)
+            })?;
+            publish(&data, &ctx, writer.finish(&roots, &next_checkpoints)?);
+            let mut index = data.write().unwrap();
+            index.scanning = false;
+            index.skipped = skipped;
+            if !warning.is_empty() {
+                index.warning = warning;
+            }
+            ctx.request_repaint();
+        } else if replayed {
+            publish(&data, &ctx, writer.finish(&roots, &next_checkpoints)?);
+            data.write().unwrap().scanning = false;
+        }
+        checkpoints = next_checkpoints;
+        startup = false;
+        full = false;
     }
+    Ok(())
 }
 
 fn cache_file(path: &Path, cache: Option<&Path>) -> bool {
     cache.is_some_and(|cache| {
-        path == cache
-            || path == cache.with_file_name("file-index.json")
-            || (path.parent() == cache.parent()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with(".nkg-index-")))
-    })
-}
-
-fn cached_item(item: &Item, cache: Option<&Path>) -> bool {
-    cache.is_some_and(|cache| {
-        cache.parent() == Some(item.parent.path.as_path()) && cache_file(&item.path(), Some(cache))
+        let parent = cache.parent();
+        let temporary = parent
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.to_string_lossy().starts_with(".nkg-index-"));
+        if temporary && parent.is_some_and(|parent| path.starts_with(parent)) {
+            return true;
+        }
+        path.parent() == parent
+            && path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                let database = cache.file_name().unwrap_or_default().to_string_lossy();
+                name == database
+                    || name.starts_with(&format!("{database}-"))
+                    || matches!(name.as_ref(), "file-index.bin" | "file-index.json")
+                    || name.starts_with(".nkg-index-")
+            })
     })
 }
 
@@ -909,53 +714,154 @@ pub fn local_roots() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "read-only real-disk indexing benchmark, stops at one million entries"]
-    fn live_million_index_latency() {
-        let start = Instant::now();
-        let engine = Engine::start(local_roots(), None, egui::Context::default());
-        let mut first = None;
+    fn wait(engine: &Engine, check: impl Fn(&Index) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let (count, scanning) = {
-                let index = engine.index.read().unwrap();
-                (index.items.len(), index.scanning)
-            };
-            if count > 0 && first.is_none() {
-                first = Some(start.elapsed());
+            let index = engine.index.read().unwrap();
+            assert!(!index.failed, "{}", index.warning);
+            if check(&index) {
+                return;
             }
-            if count >= 1_000_000 || !scanning || start.elapsed() > Duration::from_secs(120) {
-                eprintln!(
-                    "real_index first_searchable={first:?} count={count} elapsed={:?} scanning={scanning}",
-                    start.elapsed()
-                );
-                assert!(count > 0);
-                break;
-            }
+            drop(index);
+            assert!(Instant::now() < deadline, "index did not converge");
             thread::sleep(Duration::from_millis(20));
         }
     }
 
-    #[test]
-    #[ignore = "read-only first-batch latency probe on local volumes"]
-    fn live_first_batch_latency() {
-        for root in local_roots() {
-            let stop = AtomicBool::new(false);
-            let started = Instant::now();
-            let mut first = None;
-            scan_parallel(std::slice::from_ref(&root), &stop, |items| {
-                if first.is_none() && !items.is_empty() {
-                    first = Some(started.elapsed());
-                    stop.store(true, Ordering::Relaxed);
-                }
-            });
-            eprintln!(
-                "first_batch root={} latency={first:?} cancel_complete={:?}",
-                root.display(),
-                started.elapsed()
-            );
-            assert!(first.is_some(), "no initial batch on {}", root.display());
+    fn paths(engine: &Engine) -> Vec<PathBuf> {
+        let location = engine.index.read().unwrap().database.clone().unwrap();
+        let mut paths = Reader::open(location).unwrap().paths();
+        paths.sort();
+        paths
+    }
+
+    fn shutdown(engine: Engine) {
+        engine.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&engine.index) > 1 {
+            assert!(Instant::now() < deadline, "index workers did not stop");
+            thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn sqlite_live_changes_rebuild_restart_and_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("files");
+        fs::create_dir_all(root.join("old/deep")).unwrap();
+        fs::write(root.join("old/deep/配置 CONFIG.rs"), "data").unwrap();
+        let cache = temp.path().join("index.sqlite");
+        let engine = Engine::start(
+            vec![root.clone()],
+            Some(cache.clone()),
+            egui::Context::default(),
+        );
+        wait(&engine, |i| !i.scanning && i.count == 4);
+        let ticket = engine.ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        engine
+            .tx
+            .send((ticket, "DEEP 配置 config.RS".into()))
+            .unwrap();
+        let result = engine.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.hits[0].path, root.join("old/deep/配置 CONFIG.rs"));
+        fs::rename(root.join("old"), root.join("OLD")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let actual = paths(&engine);
+            if actual.contains(&root.join("OLD/deep/配置 CONFIG.rs"))
+                && !actual.contains(&root.join("old/deep/配置 CONFIG.rs"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case-only rename did not converge"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        for i in 0..1200 {
+            fs::write(root.join(format!("OLD/deep/file-{i}.txt")), "data").unwrap();
+        }
+        fs::hard_link(root.join("OLD/deep/file-0.txt"), root.join("alias.txt")).unwrap();
+        fs::rename(root.join("OLD"), root.join("renamed")).unwrap();
+        for i in (0..1200).step_by(3) {
+            fs::remove_file(root.join(format!("renamed/deep/file-{i}.txt"))).unwrap();
+        }
+        let mut expected = Vec::new();
+        scan(
+            std::slice::from_ref(&root),
+            &AtomicBool::new(false),
+            |batch| expected.extend(batch.into_iter().map(|i| i.path)),
+        );
+        expected.sort();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if paths(&engine) == expected && !engine.index.read().unwrap().scanning {
+                break;
+            }
+            assert!(Instant::now() < deadline, "notifications did not converge");
+            thread::sleep(Duration::from_millis(40));
+        }
+        let revision = engine.index.read().unwrap().revision;
+        engine.rebuild.store(true, Ordering::Relaxed);
+        wait(&engine, |i| i.revision > revision && !i.scanning);
+        assert_eq!(paths(&engine), expected);
+        shutdown(engine);
+        fs::write(root.join("offline.txt"), "new while stopped").unwrap();
+        expected.push(root.join("offline.txt"));
+        expected.sort();
+        let restarted = Engine::start(
+            vec![root.clone()],
+            Some(cache.clone()),
+            egui::Context::default(),
+        );
+        wait(&restarted, |i| !i.scanning);
+        assert_eq!(paths(&restarted), expected);
+        shutdown(restarted);
+        let narrowed = root.join("renamed");
+        let engine = Engine::start(
+            vec![narrowed.clone()],
+            Some(cache),
+            egui::Context::default(),
+        );
+        wait(&engine, |i| !i.scanning);
+        expected.retain(|p| p.starts_with(&narrowed));
+        assert_eq!(paths(&engine), expected);
+        shutdown(engine);
+    }
+
+    #[test]
+    fn sqlite_cache_and_sidecars_are_not_indexed() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("file-index.bin"),
+            "old cache must not be loaded",
+        )
+        .unwrap();
+        fs::write(temp.path().join("keep.txt"), "data").unwrap();
+        let cache = temp.path().join("file-index.sqlite");
+        let engine = Engine::start(
+            vec![temp.path().to_owned()],
+            Some(cache.clone()),
+            egui::Context::default(),
+        );
+        wait(&engine, |i| !i.scanning);
+        assert_eq!(
+            paths(&engine),
+            vec![temp.path().to_owned(), temp.path().join("keep.txt")]
+        );
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            assert!(cache_file(
+                &temp.path().join(format!("file-index.sqlite{suffix}")),
+                Some(&cache)
+            ));
+        }
+        shutdown(engine);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file-index.bin")).unwrap(),
+            "old cache must not be loaded"
+        );
     }
 
     #[test]
@@ -1068,128 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cache_is_readable_and_rejects_trailing_garbage() {
-        let input = br#"[["C:/folder/a.txt",false],["C:/folder/b.txt",false]]"#;
-        let items = load_cache(input.as_slice()).unwrap();
-        assert_eq!(items.len(), 2);
-        assert!(Arc::ptr_eq(&items[0].parent, &items[1].parent));
-        let mut invalid = input.to_vec();
-        invalid.extend(b"garbage");
-        assert!(load_cache(invalid.as_slice()).is_err());
-    }
-
-    #[test]
-    fn bulk_changes_hard_links_and_restart_converge() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("files");
-        fs::create_dir_all(root.join("old/deep")).unwrap();
-        let cache = temp.path().join("index.bin");
-        let engine = Engine::start(
-            vec![root.clone()],
-            Some(cache.clone()),
-            egui::Context::default(),
-        );
-        for i in 0..1200 {
-            fs::write(root.join(format!("old/deep/file-{i}.txt")), "data").unwrap();
-        }
-        fs::hard_link(root.join("old/deep/file-0.txt"), root.join("alias.txt")).unwrap();
-        fs::rename(root.join("old"), root.join("renamed")).unwrap();
-        for i in (0..1200).step_by(3) {
-            fs::remove_file(root.join(format!("renamed/deep/file-{i}.txt"))).unwrap();
-        }
-        let mut expected = Vec::new();
-        scan(
-            std::slice::from_ref(&root),
-            &AtomicBool::new(false),
-            |batch| expected.extend(batch.into_iter().map(|i| i.path())),
-        );
-        expected.sort();
-        let start = Instant::now();
-        loop {
-            let snapshot = engine.index.read().unwrap().items.clone();
-            let mut actual: Vec<_> = snapshot.iter().map(Item::path).collect();
-            actual.sort();
-            if actual == expected && !engine.index.read().unwrap().scanning {
-                break;
-            }
-            assert!(
-                start.elapsed() < Duration::from_secs(20),
-                "bulk notifications did not converge: {} vs {}",
-                actual.len(),
-                expected.len()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-        let snapshot = engine.index.read().unwrap().items.clone();
-        save_cache(&cache, &snapshot).unwrap();
-        let restored = Engine::start(vec![root], Some(cache), egui::Context::default());
-        let start = Instant::now();
-        loop {
-            let index = restored.index.read().unwrap();
-            if !index.scanning {
-                let mut actual: Vec<_> = index.items.iter().map(Item::path).collect();
-                actual.sort();
-                assert_eq!(actual, expected);
-                break;
-            }
-            drop(index);
-            assert!(start.elapsed() < Duration::from_secs(20));
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    #[test]
-    fn parallel_query_preserves_results_and_measures_latency() {
-        let mut parents = HashMap::new();
-        let items: Vec<_> = (0..1_000_000)
-            .map(|i| {
-                Item::new(
-                    PathBuf::from(format!("C:/项目/Assets/group-{}/file-{i}.meta", i / 100)),
-                    false,
-                    &mut parents,
-                )
-            })
-            .collect();
-        let ticket = AtomicU64::new(1);
-        for query in [
-            ".meta",
-            "group-345 file-34567",
-            "assets/group-9999/file-999999",
-            "没有匹配",
-        ] {
-            let mut serial_times = Vec::new();
-            let mut parallel_times = Vec::new();
-            for round in 0..6 {
-                let (serial, parallel) = if round % 2 == 0 {
-                    (
-                        find_serial(&items, query, 1, &ticket).unwrap(),
-                        find(&items, query, 1, &ticket).unwrap(),
-                    )
-                } else {
-                    let parallel = find(&items, query, 1, &ticket).unwrap();
-                    (find_serial(&items, query, 1, &ticket).unwrap(), parallel)
-                };
-                assert_eq!(serial.total, parallel.total);
-                assert_eq!(
-                    serial.hits.iter().map(|h| &h.path).collect::<Vec<_>>(),
-                    parallel.hits.iter().map(|h| &h.path).collect::<Vec<_>>()
-                );
-                if round > 0 {
-                    serial_times.push(serial.elapsed);
-                    parallel_times.push(parallel.elapsed);
-                }
-            }
-            serial_times.sort();
-            parallel_times.sort();
-            println!(
-                "1M paths {query:?}: serial median={:?}, parallel median={:?}",
-                serial_times[2], parallel_times[2]
-            );
-        }
-        assert!(find(&items, ".meta", 0, &ticket).is_none());
-    }
-
-    #[test]
     fn parallel_scan_matches_serial_and_cancels() {
         let temp = tempfile::tempdir().unwrap();
         let roots: Vec<_> = (0..6)
@@ -1279,112 +1063,6 @@ mod tests {
         frame(&mut search, key(egui::Key::Escape));
         assert!(!search.open);
     }
-
-    #[test]
-    fn index_search_cache_and_native_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("files");
-        fs::create_dir_all(root.join("deep")).unwrap();
-        fs::write(root.join("deep/配置 CONFIG.rs"), "data").unwrap();
-        fs::write(root.join("other.txt"), "data").unwrap();
-        let cache = dir.path().join("index.json");
-        let engine = Engine::start(
-            vec![root.clone()],
-            Some(cache.clone()),
-            egui::Context::default(),
-        );
-        let wait = |check: &dyn Fn(&Index) -> bool| {
-            let start = Instant::now();
-            loop {
-                if check(&engine.index.read().unwrap()) {
-                    break;
-                }
-                assert!(
-                    start.elapsed() < Duration::from_secs(10),
-                    "index did not converge"
-                );
-                thread::sleep(Duration::from_millis(20));
-            }
-        };
-        wait(&|index| !index.scanning && index.items.len() == 4);
-        let ticket = engine.ticket.fetch_add(1, Ordering::Relaxed) + 1;
-        engine
-            .tx
-            .send((ticket, "DEEP 配置 config.RS".into()))
-            .unwrap();
-        let result = engine.rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(result.total, 1);
-        assert_eq!(result.hits[0].path, root.join("deep/配置 CONFIG.rs"));
-        fs::rename(root.join("deep"), root.join("renamed")).unwrap();
-        wait(&|index| {
-            index
-                .items
-                .iter()
-                .any(|item| item.path() == root.join("renamed/配置 CONFIG.rs"))
-                && !index
-                    .items
-                    .iter()
-                    .any(|item| item.path().starts_with(root.join("deep")))
-        });
-        fs::write(root.join("fresh.txt"), "data").unwrap();
-        wait(&|index| {
-            index
-                .items
-                .iter()
-                .any(|item| item.path() == root.join("fresh.txt"))
-        });
-        fs::remove_file(root.join("fresh.txt")).unwrap();
-        wait(&|index| {
-            !index
-                .items
-                .iter()
-                .any(|item| item.path() == root.join("fresh.txt"))
-        });
-        save_cache(&cache, &engine.index.read().unwrap().items).unwrap();
-        let file = fs::File::open(&cache).unwrap();
-        let size = file.metadata().unwrap().len();
-        let loaded = Snapshot::read_cache(BufReader::new(file), size).unwrap();
-        assert_eq!(loaded.len(), 4);
-        assert!(
-            loaded
-                .iter()
-                .any(|item| item.path() == root.join("renamed/配置 CONFIG.rs"))
-        );
-        engine.rebuild.store(true, Ordering::Relaxed);
-        let revision = engine.index.read().unwrap().revision;
-        wait(&|index| index.revision > revision && !index.scanning);
-
-        let mut parents = HashMap::new();
-        let items: Vec<_> = (0..100_000)
-            .map(|i| {
-                Item::new(
-                    PathBuf::from(format!("C:/项目/Assets/file-{i}.rs")),
-                    false,
-                    &mut parents,
-                )
-            })
-            .collect();
-        let current = AtomicU64::new(1);
-        let result = find(&items, "assets .RS", 1, &current).unwrap();
-        assert_eq!(result.total, 100_000);
-        assert_eq!(result.hits.len(), LIMIT);
-        assert_eq!(find(&items, "FILE-99999", 1, &current).unwrap().total, 1);
-        assert_eq!(
-            find(&items, "项目/assets/file-99999", 1, &current)
-                .unwrap()
-                .total,
-            1
-        );
-        assert!(Arc::ptr_eq(&items[0].parent, &items[99_999].parent));
-        assert_eq!(find(&items, "   ", 1, &current).unwrap().total, 0);
-        assert!(find(&items, "assets", 0, &current).is_none());
-        println!(
-            "100k in-memory paths: {:.2} ms, {} hits ({} materialized)",
-            result.elapsed.as_secs_f64() * 1000.0,
-            result.total,
-            result.hits.len()
-        );
-    }
 }
 
 #[derive(Default)]
@@ -1437,7 +1115,7 @@ impl GlobalSearch {
                 }
             }
             if let Ok(index) = engine.index.try_read() {
-                self.count = index.remote_count.unwrap_or_else(|| index.items.len());
+                self.count = index.count;
                 self.scanning = index.scanning;
                 self.skipped = index.skipped;
                 self.warning.clone_from(&index.warning);
@@ -1668,7 +1346,7 @@ impl GlobalSearch {
 
 #[cfg(test)]
 pub(crate) fn verify_remote_client(client: &Arc<crate::backend::Client>, root: &Path) {
-    let cache = root.join("remote-index.bin");
+    let cache = root.join("remote-index.sqlite");
     let stream = client
         .stream(crate::backend::Command::Global {
             roots: vec![root.to_owned()],
@@ -1712,11 +1390,6 @@ pub(crate) fn verify_remote_client(client: &Arc<crate::backend::Client>, root: &
         thread::sleep(Duration::from_millis(20));
     }
     assert!(cache.exists(), "cache persistence failed");
-    let file = fs::File::open(cache).unwrap();
-    let len = file.metadata().unwrap().len();
-    assert!(
-        !Snapshot::read_cache(BufReader::new(file), len)
-            .unwrap()
-            .is_empty()
-    );
+    let location = Arc::new(database::Location::persistent(cache));
+    assert!(!Reader::open(location).unwrap().paths().is_empty());
 }

@@ -51,25 +51,6 @@ fn control<T>(
     Ok(bytes as usize)
 }
 
-pub(super) fn concurrency(root: &Path) -> usize {
-    let Some(file) = open(root, false) else {
-        return 1;
-    };
-    let query = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageDeviceSeekPenaltyProperty,
-        QueryType: PropertyStandardQuery,
-        ..Default::default()
-    };
-    let mut result = [0u8; 12];
-    if control(&file, IOCTL_STORAGE_QUERY_PROPERTY, &query, &mut result).is_ok_and(|len| len >= 9)
-        && result[8] == 0
-    {
-        4
-    } else {
-        1
-    }
-}
-
 fn state(root: &Path, file: &fs::File) -> Option<(Checkpoint, i64)> {
     let mut result = [0u8; 80];
     let size = control(file, FSCTL_QUERY_USN_JOURNAL, &[0u8; 0], &mut result).ok()?;
@@ -251,6 +232,9 @@ pub(super) fn changes(old: &Checkpoint, stop: &AtomicBool) -> Option<(Vec<PathBu
                 return Some((vec![old.root.clone()], now));
             }
             parents.insert(record.parent);
+        }
+        if parents.len() > 65_536 {
+            return None;
         }
         request.StartUsn = next;
     }
@@ -504,10 +488,9 @@ mod tests {
                 );
             }
             println!(
-                "{}: USN available={}, scan concurrency={}",
+                "{}: USN available={}",
                 root.display(),
-                checkpoint(&root).is_some(),
-                concurrency(&root)
+                checkpoint(&root).is_some()
             );
         }
     }

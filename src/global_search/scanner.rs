@@ -1,19 +1,20 @@
+//! Bounded depth-first enumeration: no all-directory queue or full-drive parent cache.
 use super::*;
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Condvar,
-};
 
-struct Task {
-    root: usize,
-    path: PathBuf,
-    metadata: Option<fs::Metadata>,
-}
-struct Queue {
-    pending: Vec<VecDeque<Task>>,
-    next: usize,
-    seen: HashSet<PathBuf>,
-    active: Vec<usize>,
+pub(super) fn minimal_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = roots.iter().map(|p| p.components().collect()).collect();
+    roots.sort();
+    roots.dedup();
+    let mut minimal: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if !minimal
+            .last()
+            .is_some_and(|parent| root.starts_with(parent))
+        {
+            minimal.push(root);
+        }
+    }
+    minimal
 }
 
 pub(super) fn run(
@@ -21,169 +22,85 @@ pub(super) fn run(
     stop: &AtomicBool,
     mut batch: impl FnMut(Vec<Item>) + Send,
 ) -> (usize, String) {
-    if stop.load(Ordering::Relaxed) || roots.is_empty() {
-        return (0, String::new());
-    }
-    let mut queue = Queue {
-        pending: Vec::new(),
-        next: 0,
-        seen: HashSet::new(),
-        active: Vec::new(),
-    };
-    let mut budgets = Vec::new();
-    let mut volumes = HashMap::new();
-    for path in roots {
-        let volume = path.ancestors().last().unwrap_or(path).to_owned();
-        let root = *volumes.entry(volume.clone()).or_insert_with(|| {
-            #[cfg(windows)]
-            let budget = ntfs::concurrency(&volume);
-            #[cfg(not(windows))]
-            let budget = 1;
-            let root = budgets.len();
-            budgets.push(budget);
-            queue.active.push(0);
-            queue.pending.push(VecDeque::new());
-            root
-        });
-        // Start reading directories immediately; a full MFT prepass delays every volume
-        // and then repeats directory I/O anyway (needed to preserve all hard-link names).
-        if queue.seen.insert(path.clone()) {
-            queue.pending[root].push_back(Task {
-                root,
-                path: path.clone(),
-                metadata: None,
-            });
-        }
-    }
-    let queue = Mutex::new(queue);
-    let changed = Condvar::new();
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Item>>(8);
-    let workers = budgets.iter().sum::<usize>().min(4);
+    let roots = minimal_roots(roots);
+    let workers = roots.len().min(4);
+    let pending = Mutex::new(roots.into_iter());
+    let (sender, receiver) = mpsc::sync_channel::<Vec<Item>>(8);
     thread::scope(|scope| {
+        // ponytail: parallelize roots, not individual subdirectories; add bounded work stealing only if scan I/O becomes the bottleneck.
         let handles: Vec<_> = (0..workers)
             .map(|_| {
-                let sender = sender.clone();
-                let queue = &queue;
-                let changed = &changed;
-                let budgets = &budgets;
+                let (sender, pending) = (sender.clone(), &pending);
                 scope.spawn(move || {
-                    let mut parents = HashMap::new();
-                    let mut items = Vec::with_capacity(4096);
-                    let mut last_flush = Instant::now();
                     let mut skipped = 0;
                     let mut warning = String::new();
-                    let mut error = |path: &Path, error: std::io::Error| {
-                        if error.kind() != std::io::ErrorKind::NotFound {
+                    let mut error = |path: &Path, e: std::io::Error| {
+                        if e.kind() != std::io::ErrorKind::NotFound {
                             skipped += 1;
                             if warning.is_empty() {
-                                warning = format!("{}：{error}", path.display());
+                                warning = format!("{}：{e}", path.display());
                             }
                         }
                     };
-                    loop {
-                        let task = {
-                            let mut state = queue.lock().unwrap();
-                            loop {
-                                if stop.load(Ordering::Relaxed) {
-                                    return (skipped, warning);
-                                }
-                                let ready = (0..state.pending.len())
-                                    .map(|n| (state.next + n) % state.pending.len())
-                                    .find(|&root| {
-                                        !state.pending[root].is_empty()
-                                            && state.active[root] < budgets[root]
-                                    });
-                                if let Some(root) = ready {
-                                    state.next = (root + 1) % state.pending.len();
-                                    let task = state.pending[root].pop_front().unwrap();
-                                    state.active[root] += 1;
-                                    break task;
-                                }
-                                if state.pending.iter().all(VecDeque::is_empty)
-                                    && state.active.iter().all(|n| *n == 0)
-                                {
-                                    drop(state);
-                                    if !items.is_empty() {
-                                        let _ = sender.send(std::mem::take(&mut items));
-                                    }
-                                    return (skipped, warning);
-                                }
-                                state = changed
-                                    .wait_timeout(state, Duration::from_millis(100))
-                                    .unwrap()
-                                    .0;
-                            }
+                    let mut items = Vec::with_capacity(4096);
+                    let mut last_flush = Instant::now();
+                    while !stop.load(Ordering::Relaxed) {
+                        let Some(root) = pending.lock().unwrap().next() else {
+                            break;
                         };
-                        let mut children = Vec::new();
-                        match task
-                            .metadata
-                            .map(Ok)
-                            .unwrap_or_else(|| fs::symlink_metadata(&task.path))
-                        {
-                            Err(e) => error(&task.path, e),
-                            Ok(metadata) => {
-                                items.push(Item::new(
-                                    task.path.clone(),
-                                    metadata.is_dir(),
-                                    &mut parents,
-                                ));
-                                if traversable(&metadata) {
-                                    match fs::read_dir(&task.path) {
-                                        Err(e) => error(&task.path, e),
-                                        Ok(entries) => {
-                                            for entry in entries {
-                                                if stop.load(Ordering::Relaxed) {
-                                                    break;
-                                                }
-                                                match entry {
-                                                    Err(e) => error(&task.path, e),
-                                                    Ok(entry) => match entry.metadata() {
-                                                        Err(e) => error(&entry.path(), e),
-                                                        Ok(metadata) => {
-                                                            if traversable(&metadata) {
-                                                                children.push(Task {
-                                                                    root: task.root,
-                                                                    path: entry.path(),
-                                                                    metadata: Some(metadata),
-                                                                });
-                                                            } else {
-                                                                items.push(Item::new(
-                                                                    entry.path(),
-                                                                    metadata.is_dir(),
-                                                                    &mut parents,
-                                                                ));
-                                                            }
-                                                        }
-                                                    },
-                                                }
-                                                if items.len() >= 4096
-                                                    && sender
-                                                        .send(std::mem::take(&mut items))
-                                                        .is_err()
-                                                {
-                                                    return (skipped, warning);
-                                                }
+                        let mut stack = Vec::<fs::ReadDir>::new();
+                        let mut next = Some((root.clone(), fs::symlink_metadata(&root)));
+                        loop {
+                            if stop.load(Ordering::Relaxed) {
+                                return (skipped, warning);
+                            }
+                            if let Some((path, metadata)) = next.take() {
+                                match metadata {
+                                    Err(e) => error(&path, e),
+                                    Ok(metadata) => {
+                                        items.push(Item::new(path.clone(), metadata.is_dir()));
+                                        if traversable(&metadata) {
+                                            match fs::read_dir(&path) {
+                                                Ok(entries) => stack.push(entries),
+                                                Err(e) => error(&path, e),
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        if !items.is_empty() && last_flush.elapsed() >= Duration::from_millis(100) {
-                            if sender.send(std::mem::take(&mut items)).is_err() {
-                                return (skipped, warning);
+                            if items.len() >= 4096
+                                || (!items.is_empty()
+                                    && last_flush.elapsed() >= Duration::from_millis(100))
+                            {
+                                if sender.send(std::mem::take(&mut items)).is_err() {
+                                    return (skipped, warning);
+                                }
+                                last_flush = Instant::now();
                             }
-                            last_flush = Instant::now();
-                        }
-                        let mut state = queue.lock().unwrap();
-                        for task in children {
-                            if state.seen.insert(task.path.clone()) {
-                                state.pending[task.root].push_back(task);
+                            while let Some(entries) = stack.last_mut() {
+                                match entries.next() {
+                                    Some(Ok(entry)) => {
+                                        next = Some((entry.path(), entry.metadata()));
+                                        break;
+                                    }
+                                    Some(Err(e)) => error(&root, e),
+                                    None => {
+                                        stack.pop();
+                                    }
+                                }
+                                if stop.load(Ordering::Relaxed) {
+                                    return (skipped, warning);
+                                }
+                            }
+                            if next.is_none() {
+                                break;
                             }
                         }
-                        state.active[task.root] -= 1;
-                        changed.notify_all();
                     }
+                    if !items.is_empty() && !stop.load(Ordering::Relaxed) {
+                        let _ = sender.send(items);
+                    }
+                    (skipped, warning)
                 })
             })
             .collect();
